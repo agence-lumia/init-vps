@@ -548,6 +548,50 @@ collect_manager() {
     prompt DOKPLOY_MANAGER_KEY "Clé publique SSH du manager (générée dans Dokploy)" "" validate_dokploy_pubkey
 }
 
+# IPv4 privée par laquelle ce serveur est joint sur le réseau privé : la source
+# de la route vers le manager si elle est privée, sinon la première IPv4 privée
+# d'une interface réelle (hors Docker). Vide si aucune.
+detect_private_addr() {
+    local a="" ifc addr
+    if [[ -n "$MANAGER_IP" ]]; then
+        a="$(ip -4 route get "$MANAGER_IP" 2>/dev/null | grep -oP '\bsrc \K[0-9.]+' | head -n1 || true)"
+        if is_private_ipv4 "$a"; then
+            echo "$a"
+            return 0
+        fi
+    fi
+    while read -r ifc addr; do
+        case "$ifc" in lo|docker*|br-*|veth*|virbr*) continue ;; esac
+        if is_private_ipv4 "$addr"; then
+            echo "$addr"
+            return 0
+        fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print $2, a[1]}')
+    return 0
+}
+
+# Vide, ou une IPv4 réellement portée par ce serveur.
+validate_local_ipv4() {
+    [[ -z "$1" ]] && return 0
+    is_valid_ipv4 "$1" && ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$1"
+}
+
+# Rôle remote : adresse d'annonce du swarm. Dokploy l'initialiserait sinon avec
+# l'IP PUBLIQUE (« Advertise address » de son Setup Server) — mesuré : après un
+# changement d'IP publique (Primary IP déplacée), le nœud restait annoncé sur
+# une adresse qui n'existait plus sur le serveur. L'IP privée, elle, ne change pas.
+collect_remote_swarm_addr() {
+    log_step "Adresse Docker Swarm (remote)"
+    local detected
+    detected="$(detect_private_addr)"
+    if [[ -n "$detected" ]]; then
+        log_info "IP privée détectée : ${detected}. Le swarm y sera initialisé AVANT le Setup de Dokploy : une IP publique qui change ne le casse plus."
+    else
+        log_warn "Aucune IP privée détectée (serveur hors réseau privé ?). Vide = laisser Dokploy initialiser le swarm sur l'IP publique."
+    fi
+    prompt ADVERTISE_ADDR "Adresse d'annonce Docker Swarm (IP privée de ce serveur)" "$detected" validate_local_ipv4
+}
+
 collect_timezone() {
     log_step "Fuseau horaire"
     prompt TIMEZONE "Fuseau horaire (format Region/Ville)" "Europe/Paris" validate_timezone
@@ -628,6 +672,7 @@ show_recap() {
             else
                 echo "  Manager Dokploy           : à configurer plus tard (vps-helper manager)"
             fi
+            echo "  Adresse Docker Swarm       : ${ADVERTISE_ADDR:-laissée à Dokploy (IP publique)}"
         fi
         if [[ "$NOTIFY_ENABLED" == "1" ]]; then
             echo "  Notifications             : webhook"
@@ -3642,7 +3687,21 @@ cmd_manager() {
 check_dokploy_remote() {
     [ "$(state_get SERVER_ROLE)" = "2" ] || return 0
     chk_sect "Accès du manager Dokploy"
-    local ip home ak lines bad sshd_cfg allow port ours lim
+    local ip home ak lines bad sshd_cfg allow port ours lim node
+    # Adresse d'annonce du swarm : une IP publique change (Primary IP déplacée,
+    # serveur recréé) et le nœud reste annoncé sur une adresse morte — mesuré.
+    if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
+        node="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)"
+        if ! ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$node"; then
+            chk_fail "Swarm annoncé sur ${node}, adresse absente de ce serveur (IP publique changée ?) — réinitialiser le swarm sur l'IP privée (voir CLAUDE.md)"; fail=$((fail+1))
+        elif [[ "$node" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
+            chk_pass "Swarm annoncé sur l'IP privée ${node}"; pass=$((pass+1))
+        else
+            chk_warn "Swarm annoncé sur l'IP publique ${node} : un changement d'IP le laisserait sur une adresse morte"
+        fi
+    else
+        chk_info "Docker Swarm inactif (Setup Server de Dokploy pas encore lancé ?)"
+    fi
     ip="$(state_get MANAGER_IP)"
     if [ -z "$ip" ]; then
         chk_warn "Manager Dokploy non configuré (sudo vps-helper manager --ip <IP> --key \"<clé>\")"
@@ -4413,6 +4472,43 @@ step_traefik_tuning() {
 # La clé n'est connue qu'à la collecte : en mode mise à jour, vps-helper garde
 # celle déjà posée et réaligne tout sur $MANAGER_IP.
 ###############################################################################
+# Rôle remote : swarm initialisé sur l'IP privée AVANT le Setup de Dokploy,
+# qui le trouve alors actif et saute sa propre initialisation (setupSwarm :
+# « Already part of a Docker Swarm »). Seul --advertise-addr est fixé : un
+# --listen-addr privé dépendrait de l'ordre d'apparition des interfaces au
+# boot, et 2377 reste de toute façon fermé en entrée par UFW.
+# Swarm déjà actif sur une autre adresse : jamais corrigé ici — quitter le
+# swarm supprimerait services et réseaux overlay en production.
+step_remote_swarm() {
+    log_step "Docker Swarm sur l'IP privée (remote)"
+    if [[ -z "$ADVERTISE_ADDR" ]]; then
+        ADVERTISE_ADDR="$(detect_private_addr)"
+        [[ -n "$ADVERTISE_ADDR" ]] && log_info "IP privée détectée : ${ADVERTISE_ADDR}."
+    fi
+    local state node
+    state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)"
+    if [[ "$state" == "active" ]]; then
+        node="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null || true)"
+        if [[ -n "$ADVERTISE_ADDR" && "$node" == "$ADVERTISE_ADDR" ]]; then
+            log_info "Swarm déjà actif sur ${node}, rien à faire."
+        elif ! validate_local_ipv4 "$node"; then
+            log_warn "Swarm annoncé sur ${node}, adresse qui n'est PLUS sur ce serveur (IP publique changée ?). Aucune correction automatique : voir « vps-helper check » et CLAUDE.md (réinitialiser le swarm sur l'IP privée, puis relancer le Setup Server de Dokploy)."
+        else
+            log_warn "Swarm annoncé sur ${node} (initialisé par Dokploy ?), et non sur l'IP privée ${ADVERTISE_ADDR:-(aucune)} : un changement d'IP le laisserait sur une adresse morte. Aucune correction automatique."
+        fi
+        return
+    fi
+    if [[ -z "$ADVERTISE_ADDR" ]]; then
+        log_warn "Aucune IP privée : swarm non initialisé, Dokploy le fera sur l'IP publique."
+        return
+    fi
+    if docker swarm init --advertise-addr "$ADVERTISE_ADDR" >/dev/null 2>&1; then
+        log_ok "Swarm initialisé sur l'IP privée ${ADVERTISE_ADDR} (le Setup Server de Dokploy le réutilisera)."
+    else
+        log_warn "docker swarm init --advertise-addr ${ADVERTISE_ADDR} a échoué : Dokploy initialisera le swarm lui-même (IP publique)."
+    fi
+}
+
 step_dokploy_remote() {
     log_step "Accès du manager Dokploy (compte dokploy)"
     if [[ -z "$MANAGER_IP" ]]; then
@@ -5207,6 +5303,7 @@ main() {
             collect_advertise_addr
         else
             collect_manager
+            collect_remote_swarm_addr
         fi
         collect_notify
         collect_auto_reboot
@@ -5255,6 +5352,7 @@ main() {
         log_info "Rôle 'remote server' : Dokploy ne sera pas installé ici, il sera ajouté depuis le manager central."
         # ensure_docker AVANT : le groupe docker doit exister pour y mettre dokploy.
         ensure_docker
+        step_remote_swarm
         step_dokploy_remote
     fi
     step_notify

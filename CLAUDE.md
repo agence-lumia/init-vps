@@ -587,6 +587,39 @@ autre-clé »
   groupe docker, sudoers valide **et** `runuser -u dokploy -- sudo -n true`,
   chaque clé derrière `from="IP"`, `AllowUsers`, règle UFW avant la limite,
   `ignoreip` (WARN).
+- **Swarm sur l'IP privée** (`step_remote_swarm`, avant `step_dokploy_remote`) :
+  le Setup Server de Dokploy initialise le swarm avec l'**IP publique**
+  (`server-setup.ts`, `get_ip` via ifconfig.io). Mesuré le 29/09/2026 : IP
+  publique du remote remplacée par une autre Primary IP → le site revient seul
+  et un service Swarm se planifie encore (nœud unique), mais le nœud reste
+  annoncé (`NodeAddr`, pairs de `dokploy-network`) sur une adresse qui n'existe
+  plus — tout ajout de nœud ou trafic overlay entre nœuds casserait. init-vps
+  fait donc `docker swarm init --advertise-addr <IP privée>` avant le Setup, qui
+  trouve le swarm actif et saute le sien. IP détectée par `detect_private_addr`
+  (source de la route vers le manager, sinon 1re IPv4 privée hors Docker),
+  confirmée à l'installation (`collect_remote_swarm_addr`, validée présente sur
+  le serveur), persistée dans `ADVERTISE_ADDR`. Pas de `--listen-addr` : il
+  dépendrait de l'ordre d'apparition des interfaces au boot (2377 reste fermé
+  par UFW). Swarm déjà actif ailleurs : **jamais** corrigé automatiquement
+  (`docker swarm leave --force` supprimerait services et réseaux) ; `check` le
+  signale — FAIL si l'adresse n'est plus sur le serveur, WARN si publique.
+  Correction manuelle : `docker swarm leave --force`, `docker swarm init
+  --advertise-addr <IP privée>`, puis « Setup Server » dans Dokploy et
+  redéploiement des applications.
+- **Onglet « Security » de Dokploy : faux positifs connus**, ne rien changer
+  (`packages/server/src/setup/server-audit.ts`, v0.30.8) :
+  - *Password Auth « Enabled »* : Dokploy ne lit que `/etc/ssh/sshd_config`
+    (`grep ^PasswordAuthentication`, défaut « yes » si absent), jamais
+    `sshd_config.d/99-hardening.conf`. Valeur effective : `sshd -T` →
+    `passwordauthentication no`.
+  - *Fail2Ban « SSH Protection Not Enabled »* : il lit
+    `grep -A10 "^\[sshd\]" jail.local | grep enabled`. Chez nous, `[recidive]`
+    commence dans ces 10 lignes : il obtient « truetrue » au lieu de « true »
+    (reproduit). Valeur effective : `fail2ban-client status sshd`, jail active.
+  - *Use PAM « Enabled »* : pas un faux positif, un choix. `UsePAM yes` (défaut
+    Ubuntu) fait passer le MOTD (`pam_motd`) et les sessions logind ; avec
+    `PasswordAuthentication no` et `KbdInteractiveAuthentication no`, PAM
+    n'ouvre aucune porte.
 - Résumé : l'étape « Ajouter au manager » donne l'IP par laquelle le manager
   joint ce serveur (`ip route get <IP_MANAGER>` → `src`, donc la privée sur un
   réseau Hetzner), le port, l'utilisateur `dokploy`. Elle disparaît une fois
