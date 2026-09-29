@@ -296,6 +296,16 @@ validate_ip_cidr() {
     is_valid_ipv4 "$val"
 }
 
+# Restriction d'accès au panneau Dokploy : une IP ou un CIDR d'au moins /8.
+# « 0.0.0.0/0 » (ou un /1…/7) reviendrait à ouvrir le port à tout Internet —
+# précisément ce qu'on refuse (le premier visiteur crée le compte propriétaire).
+# Même borne dans apply.sh.
+validate_dokploy_restrict_ip() {
+    [[ -z "$1" ]] && return 0
+    validate_ip_cidr "$1" || return 1
+    [[ "$1" != */* ]] || (( ${1##*/} >= 8 ))
+}
+
 validate_ip_loose() {
     local val="$1"
     [[ -z "$val" ]] && return 0
@@ -497,8 +507,10 @@ collect_server_role() {
 
 collect_dokploy_restrict_ip() {
     log_step "Accès à l'interface Dokploy (port 3000)"
-    log_info "Le port 3000 sera ouvert, le temps de configurer un nom de domaine + TLS dans Dokploy (fermeture manuelle ensuite)."
-    prompt DOKPLOY_RESTRICT_IP "Restreindre cet accès à une IP/CIDR précise (vide = ouvert à tous temporairement)" "" validate_ip_cidr
+    log_info "Un Dokploy neuf laisse le PREMIER visiteur créer le compte propriétaire : le port 3000 n'est jamais ouvert à tout Internet."
+    log_info "IP/CIDR saisie : 3000 ouvert à elle seule, le temps de configurer le domaine (fermer ensuite : vps-helper close-dokploy)."
+    log_info "Vide : port fermé, accès par tunnel SSH (ssh -L 3000:127.0.0.1:3000 …), commande rappelée à la fin."
+    prompt DOKPLOY_RESTRICT_IP "IP/CIDR autorisée sur le port 3000 (vide = fermé, tunnel SSH)" "" validate_dokploy_restrict_ip
 }
 
 collect_advertise_addr() {
@@ -606,7 +618,7 @@ show_recap() {
         echo "  Swap                      : ${swap_line}"
         echo "  Rôle du serveur           : ${role_line}"
         if [[ "$SERVER_ROLE" == "1" ]]; then
-            [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="ouvert temporairement à tous"
+            [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="fermé (tunnel SSH)"
             [[ -n "$ADVERTISE_ADDR" ]] && advertise_line="${ADVERTISE_ADDR}" || advertise_line="auto-détection (Dokploy)"
             echo "  Accès Dokploy (port 3000) : ${dokploy_line}"
             echo "  Adresse Docker Swarm       : ${advertise_line}"
@@ -1100,13 +1112,27 @@ EOF
 ###############################################################################
 # 6. UFW — RÈGLES DE BASE
 ###############################################################################
-# Accès au panneau Dokploy (3000/tcp) : « any », une IP/CIDR, ou vide (fermé
-# ou rôle remote). Seule source de cette décision, pour UFW (step_ufw_base)
-# comme pour DOCKER-USER (step_docker_user_firewall) : c'est DOCKER-USER qui
-# filtre réellement un port publié par Docker, UFW ne le voit pas.
+# Accès au panneau Dokploy (3000/tcp) : une IP/CIDR, ou vide (fermé, rôle
+# remote, ou aucune restriction saisie). JAMAIS tout Internet : un Dokploy neuf
+# laisse le premier visiteur créer le compte propriétaire. Sans IP, l'accès se
+# fait par tunnel SSH. Seule source de cette décision, pour UFW
+# (step_ufw_base) comme pour DOCKER-USER (step_docker_user_firewall) : c'est
+# DOCKER-USER qui filtre réellement un port publié par Docker. Une valeur de
+# config.env trop large (« 0.0.0.0/0 ») est ignorée, comme à la saisie.
 dokploy_ui_source() {
-    [[ "$SERVER_ROLE" == "1" && "$DOKPLOY_PORT_CLOSED" != "1" ]] || return 0
-    echo "${DOKPLOY_RESTRICT_IP:-any}"
+    [[ "$SERVER_ROLE" == "1" && "$DOKPLOY_PORT_CLOSED" != "1" && -n "$DOKPLOY_RESTRICT_IP" ]] || return 0
+    validate_dokploy_restrict_ip "$DOKPLOY_RESTRICT_IP" || return 0
+    echo "$DOKPLOY_RESTRICT_IP"
+}
+
+# Commande de tunnel vers le panneau Dokploy (port 3000 fermé).
+dokploy_tunnel_hint() {
+    local host="${SERVER_IP:-<IP_DU_SERVEUR>}"
+    if [[ "$SSH_PORT" == "22" ]]; then
+        echo "ssh -L 3000:127.0.0.1:3000 ${ADMIN_USER}@${host}, puis http://127.0.0.1:3000"
+    else
+        echo "ssh -p ${SSH_PORT} -L 3000:127.0.0.1:3000 ${ADMIN_USER}@${host}, puis http://127.0.0.1:3000"
+    fi
 }
 
 step_ufw_base() {
@@ -1148,16 +1174,14 @@ step_ufw_base() {
     ui_src="$(dokploy_ui_source)"
     if [[ "$SERVER_ROLE" != "1" ]]; then
         log_info "Rôle 'remote server' : port 3000 (Dokploy) non ouvert, non applicable."
-    elif [[ -z "$ui_src" ]]; then
+    elif [[ "$DOKPLOY_PORT_CLOSED" == "1" ]]; then
         log_info "Port 3000 laissé fermé (fermé précédemment via « vps-helper close-dokploy »)."
-    elif [[ "$ui_src" != "any" ]]; then
-        ufw allow from "$ui_src" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
+    elif [[ -z "$ui_src" ]]; then
+        log_info "Port 3000 fermé : un Dokploy neuf laisse le premier visiteur créer le compte propriétaire. Accès par tunnel SSH : $(dokploy_tunnel_hint)"
     else
-        ufw allow 3000/tcp comment 'Dokploy UI - a fermer manuellement apres config domaine' >/dev/null
-        log_warn "Port 3000 ouvert à tous. Fermeture requise une fois le domaine et le TLS configurés dans Dokploy (sudo vps-helper close-dokploy)."
-    fi
-    if [[ -n "$ui_src" ]]; then
-        log_warn "Pare-feu externe (Hetzner Cloud Firewall…) : y autoriser aussi 3000/tcp le temps de configurer le domaine dans Dokploy, puis l'en retirer après close-dokploy. Il est invisible d'ici."
+        ufw allow from "$ui_src" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
+        log_warn "Port 3000 ouvert à ${ui_src} seulement, le temps de configurer le domaine (fermer ensuite : sudo vps-helper close-dokploy)."
+        log_warn "Pare-feu externe (Hetzner Cloud Firewall…) : y autoriser aussi 3000/tcp depuis ${ui_src}, puis l'en retirer après close-dokploy. Il est invisible d'ici."
     fi
 
     ufw --force enable >/dev/null
@@ -3759,7 +3783,7 @@ cmd_check() {
             if [ -s /etc/dokploy/traefik/dynamic/acme.json ] && grep -q '"main"[[:space:]]*:' /etc/dokploy/traefik/dynamic/acme.json 2>/dev/null; then
                 chk_warn "Port 3000/tcp (panneau Dokploy) encore ouvert alors qu'un domaine TLS est actif — fermer : vps-helper close-dokploy"
             else
-                chk_info "Port 3000/tcp (panneau Dokploy) ouvert le temps de configurer le domaine — fermer ensuite : vps-helper close-dokploy"
+                chk_info "Port 3000/tcp (panneau Dokploy) ouvert à $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement, le temps de configurer le domaine — fermer ensuite : vps-helper close-dokploy"
             fi
             exposed=1
         else
@@ -4068,22 +4092,22 @@ iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 80 "${COMMENT[@]}" -j RETURN
 iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 443 "${COMMENT[@]}" -j RETURN
 iptables -A DOCKER-USER -i "$IFACE" -p udp --dport 443 "${COMMENT[@]}" -j RETURN
 
-# Panneau Dokploy (3000/tcp), tant qu'il n'est pas fermé (vps-helper
-# close-dokploy retire ce fichier) : sans cette règle, la règle UFW qui ouvre
-# 3000 est sans effet — l'interface était injoignable juste après
-# l'installation, le temps précisément d'y configurer le domaine.
-# Contenu : « any » ou une IPv4/CIDR, revalidé ici.
+# Panneau Dokploy (3000/tcp) ouvert à UNE IP/CIDR, tant qu'il n'est pas fermé
+# (vps-helper close-dokploy retire ce fichier). Sans cette règle, la règle UFW
+# qui ouvre 3000 est sans effet : UFW ne voit pas un port publié par Docker.
+# Jamais tout Internet (un Dokploy neuf laisse le premier visiteur créer le
+# compte propriétaire) : toute autre valeur — « any », un masque < /8 — laisse
+# le port bloqué. Pas de miroir IPv6 : la restriction est une IPv4.
 DOKPLOY_UI_FILE=/usr/local/lib/docker-user/dokploy-ui
 DOKPLOY_UI=""
 if [ -r "$DOKPLOY_UI_FILE" ]; then
     DOKPLOY_UI="$(head -n 1 "$DOKPLOY_UI_FILE" | tr -d '[:space:]')"
 fi
-if [ "$DOKPLOY_UI" = "any" ]; then
-    iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 3000 "${COMMENT[@]}" -j RETURN
-elif [[ "$DOKPLOY_UI" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+if [[ "$DOKPLOY_UI" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]{1,2}))?$ ]] \
+        && { [ -z "${BASH_REMATCH[3]}" ] || [ "${BASH_REMATCH[3]}" -ge 8 ]; }; then
     iptables -A DOCKER-USER -i "$IFACE" -s "$DOKPLOY_UI" -p tcp --dport 3000 "${COMMENT[@]}" -j RETURN
 elif [ -n "$DOKPLOY_UI" ]; then
-    echo "docker-user: ${DOKPLOY_UI_FILE} illisible (« ${DOKPLOY_UI} ») — port 3000 laissé bloqué." >&2
+    echo "docker-user: ${DOKPLOY_UI_FILE} refusé (« ${DOKPLOY_UI} », une IP/CIDR ≥ /8 attendue) — port 3000 laissé bloqué." >&2
 fi
 
 # Réseaux privés (réseau interne du provider, VPN, autres nœuds Swarm).
@@ -4119,9 +4143,6 @@ ip6tables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED "${COMMENT[@
 ip6tables -A DOCKER-USER -i "$IFACE6" -p tcp --dport 80 "${COMMENT[@]}" -j RETURN
 ip6tables -A DOCKER-USER -i "$IFACE6" -p tcp --dport 443 "${COMMENT[@]}" -j RETURN
 ip6tables -A DOCKER-USER -i "$IFACE6" -p udp --dport 443 "${COMMENT[@]}" -j RETURN
-if [ "$DOKPLOY_UI" = "any" ]; then
-    ip6tables -A DOCKER-USER -i "$IFACE6" -p tcp --dport 3000 "${COMMENT[@]}" -j RETURN
-fi
 # Équivalent v6 des réseaux privés : adresses ULA.
 ip6tables -A DOCKER-USER -i "$IFACE6" -s fc00::/7 "${COMMENT[@]}" -j RETURN
 ip6tables -A DOCKER-USER -i "$IFACE6" "${COMMENT[@]}" -j DROP
@@ -4220,7 +4241,7 @@ UNITEOF
     else
         "$DOCKER_USER_APPLY"
     fi
-    log_ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp${ui_src:+, 3000/tcp pour Dokploy} et réseaux privés autorisés ; le reste bloqué)."
+    log_ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp${ui_src:+, 3000/tcp depuis ${ui_src} pour Dokploy} et réseaux privés autorisés ; le reste bloqué)."
 }
 
 ###############################################################################
@@ -4244,7 +4265,7 @@ step_docker_ports_audit() {
         [[ -z "$p" ]] && continue
         case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
         if [[ "$p" == "3000/tcp" && -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
-            log_info "Port 3000/tcp (panneau Dokploy) ouvert volontairement jusqu'à « sudo vps-helper close-dokploy »."
+            log_info "Port 3000/tcp (panneau Dokploy) ouvert à $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement, jusqu'à « sudo vps-helper close-dokploy »."
             continue
         fi
         log_warn "Port ${p} publié sur toutes les interfaces (conteneur ou service Swarm)."
@@ -4950,9 +4971,15 @@ print_summary() {
             # Ne pas annoncer une URL qui ne répond plus : une fois le port
             # fermé, l'interface passe par le domaine configuré dans Dokploy.
             if dokploy_port_is_open; then
-                echo "Dokploy           : http://${SERVER_IP}:3000"
-            else
+                if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+                    echo "Dokploy           : http://${SERVER_IP}:3000 (depuis $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement)"
+                else
+                    echo "Dokploy           : http://${SERVER_IP}:3000"
+                fi
+            elif dokploy_has_tls_domain; then
                 echo "Dokploy           : installé — port 3000 fermé, accès par le domaine configuré"
+            else
+                echo "Dokploy           : installé — port 3000 fermé, accès par tunnel SSH (voir ci-dessous)"
             fi
         else
             echo "Rôle              : Remote server — prêt à être ajouté depuis Dokploy (Settings → Servers → Add Server)"
@@ -4989,11 +5016,14 @@ print_summary() {
                 echo "${step_n}. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
                 step_n=$((step_n+1))
                 step_sep
-                echo "${step_n}. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
-                if [[ "$port_open" -eq 1 ]]; then
-                    echo "     Pare-feu Hetzner (Cloud Firewall) : y autoriser 3000/tcp le temps de cette configuration."
+                # Jamais d'URL publique sans restriction : un Dokploy neuf laisse
+                # le premier visiteur créer le compte propriétaire.
+                if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+                    echo "${step_n}. Depuis $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") : ouvrir http://${SERVER_IP}:3000, créer le compte propriétaire, configurer le domaine et le TLS."
+                    echo "     Pare-feu Hetzner (Cloud Firewall) : y autoriser 3000/tcp depuis cette IP le temps de la configuration."
                 else
-                    echo "     Port 3000 fermé : passer par un tunnel SSH — $(ssh_cmd_hint "$SERVER_IP" | sed 's/^ssh /ssh -L 3000:127.0.0.1:3000 /'), puis http://127.0.0.1:3000"
+                    echo "${step_n}. Ouvrir Dokploy par un tunnel SSH, créer le compte propriétaire, configurer le domaine et le TLS :"
+                    echo "     $(dokploy_tunnel_hint)"
                 fi
                 step_n=$((step_n+1))
             fi

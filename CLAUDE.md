@@ -110,31 +110,44 @@ Côté vps-helper : `cmd_docker_firewall` (`status|apply|clear`, dans
 `clear` est le filet de sécurité si les règles cassent un service en production.
 Le heredoc `APPLYEOF` est validé par une porte dédiée dans `lint.yml`.
 
-#### Panneau Dokploy (3000/tcp) : c'est DOCKER-USER qui l'ouvre, pas UFW
+#### Panneau Dokploy (3000/tcp) : jamais ouvert à tout Internet
 
-Mesuré sur une installation neuve (24.04 et 26.04, release 2026.09.15.4) :
-`step_ufw_base` ouvrait 3000/tcp dans UFW et le résumé affichait
-`http://IP:3000`, mais le DROP de `DOCKER-USER` bloquait le port. Le panneau
-était **injoignable** précisément quand il fallait y configurer le domaine.
+**Un Dokploy neuf laisse le premier visiteur créer le compte propriétaire.**
+Le port 3000 n'est donc jamais ouvert à tout Internet :
 
-- `dokploy_ui_source()` est la **seule** décision : `any`, une IP/CIDR
-  (`DOKPLOY_RESTRICT_IP`), ou vide (rôle remote, ou `DOKPLOY_PORT_CLOSED=1`).
-  `step_ufw_base` et `step_docker_user_firewall` la lisent tous les deux.
-- `step_docker_user_firewall` l'écrit dans `/usr/local/lib/docker-user/dokploy-ui`.
-  `apply.sh` lit ce fichier, revalide la valeur et ajoute un RETURN sur 3000/tcp
-  avant le DROP (miroir v6 seulement pour `any`).
-- `vps-helper close-dokploy` supprime le fichier et relance `apply.sh`, à
-  condition que la chaîne porte nos règles.
+| `DOKPLOY_RESTRICT_IP` | Port 3000 |
+|---|---|
+| IP ou CIDR ≥ /8 | ouvert à elle seule (UFW **et** DOCKER-USER), jusqu'à `close-dokploy` |
+| vide (défaut) | fermé — accès par `ssh -L 3000:127.0.0.1:3000 admin@IP` (`dokploy_tunnel_hint`), rappelé par `step_ufw_base` et le résumé |
+
+`validate_dokploy_restrict_ip` refuse un masque < /8 (`0.0.0.0/0` reviendrait à
+tout ouvrir) ; `dokploy_ui_source` ignore une telle valeur venue de `config.env`,
+et `apply.sh` la refuse à son tour. ⚠️ Un serveur installé par une ancienne
+version avec le port ouvert à tous, sans restriction : un `--update` le **ferme**
+(`step_ufw_base` retire toute règle 3000 avant de décider). C'est voulu.
+
+Historique : la release 2026.09.15.4 ouvrait 3000 dans UFW à tous, mais le DROP
+de `DOCKER-USER` bloquait le port (UFW ne voit pas un port publié par Docker) :
+le panneau était injoignable. Le correctif ne l'ouvre plus qu'à l'IP restreinte.
+
+- `dokploy_ui_source()` est la **seule** décision (IP/CIDR ou vide). `step_ufw_base`
+  et `step_docker_user_firewall` la lisent tous les deux.
+- `step_docker_user_firewall` l'écrit dans `/usr/local/lib/docker-user/dokploy-ui` ;
+  `apply.sh` la revalide et ajoute `-s <IP> --dport 3000 -j RETURN` avant le DROP.
+  Toute autre valeur (dont l'ancien `any`) laisse le port bloqué. Pas de miroir v6.
+- `vps-helper close-dokploy` supprime le fichier et relance `apply.sh` (si la
+  chaîne porte nos règles).
 - `check` : un port publié derrière nos règles n'est plus un FAIL (il est
   bloqué, INFO). FAIL seulement si la chaîne est vide ; WARN si le filtrage vient
-  de règles tierces. Le port 3000 ouvert volontairement donne une INFO, qui
+  de règles tierces. Le port 3000 ouvert à l'IP restreinte donne une INFO, qui
   devient WARN si `acme.json` contient déjà un domaine.
 
 #### Pare-feu Hetzner (Cloud Firewall)
 
-Invisible depuis le serveur, on ne peut que le **rappeler** : `step_ufw_base`
-et le résumé demandent d'y autoriser 3000/tcp le temps de configurer le
-domaine, puis `close-dokploy` rappelle de l'en retirer. Il **ne filtre pas le
+Invisible depuis le serveur, on ne peut que le **rappeler** : avec une IP
+restreinte, `step_ufw_base` et le résumé demandent d'y autoriser 3000/tcp depuis
+cette IP le temps de configurer le domaine, puis `close-dokploy` rappelle de
+l'en retirer. Il **ne filtre pas le
 réseau privé** (FAQ Hetzner : « we consider the private networks to be
 'secure' ») : un manager qui joint son remote par IP privée n'a besoin d'aucune
 règle Hetzner. Une IP de manager **publique** déclenche un rappel dans le résumé.
@@ -541,7 +554,8 @@ script de mise en place (`server-setup.ts`) teste `$EUID` : le shell doit être
   publique générée dans Dokploy (`validate_dokploy_pubkey`). `MANAGER_IP` va dans
   `config.env` ; la clé **uniquement** dans `authorized_keys` (`DOKPLOY_MANAGER_KEY`,
   en mémoire). ⚠️ `validate_dokploy_pubkey` refuse explicitement `
-`/`` :
+`/`
+` :
   dans une regex bash, `.` matche le saut de ligne, et « clé
 autre-clé »
   ajouterait une seconde clé **sans** `from=`.
