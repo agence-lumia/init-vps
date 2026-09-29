@@ -10,9 +10,11 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
   `00-studiokyne` : `step_motd` retire l'ancien fichier **après** avoir installé le
   nouveau (même schéma que `99-swap.conf`), sinon `run-parts` afficherait deux MOTD.
   `motd-news` est neutralisé **avant** le `chmod -x` des scripts Ubuntu
-  (`mask --now` du timer, `ENABLED=0`, `reset-failed`) : dans l'ordre inverse, un
+  (arrêt du timer PUIS `mask`, `ENABLED=0`, `reset-failed`) : dans l'ordre inverse, un
   déclenchement du timer entre les deux laissait `motd-news.service` en échec
   (203/EXEC), remonté en FAIL par `check` (mesuré sur une installation neuve 26.04).
+  Et le timer est **arrêté avant** d'être masqué : masqué encore actif, il
+  échoue au `daemon-reload` suivant (« Unit to trigger vanished »), mesuré aussi.
 - **vps-helper** (`/usr/local/bin/vps-helper`) — délimité par `HELPEREOF`
 - **apply.sh** (`/usr/local/lib/docker-user/apply.sh`) — délimité par `APPLYEOF`
 - **vps-notify** (`/usr/local/bin/vps-notify`) — délimité par `NOTIFYEOF`

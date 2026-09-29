@@ -1617,12 +1617,15 @@ step_motd() {
     # et restait en échec (203/EXEC) — mesuré sur une installation neuve 26.04,
     # remonté en FAIL par `check`. mask plutôt que disable : une mise à jour du
     # paquet ne le réactive pas. ENABLED=0 est le réglage prévu par Ubuntu.
-    systemctl mask --now motd-news.timer >/dev/null 2>&1 || true
-    systemctl stop motd-news.service >/dev/null 2>&1 || true
+    # Arrêt AVANT le masquage : un timer masqué encore actif échoue au
+    # daemon-reload suivant (« Unit to trigger vanished », Result: resources),
+    # mesuré sur une installation neuve 26.04.
+    systemctl stop motd-news.timer motd-news.service >/dev/null 2>&1 || true
+    systemctl mask motd-news.timer >/dev/null 2>&1 || true
     if [[ -f /etc/default/motd-news ]]; then
         sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
     fi
-    systemctl reset-failed motd-news.service >/dev/null 2>&1 || true
+    systemctl reset-failed motd-news.timer motd-news.service >/dev/null 2>&1 || true
     if [[ -d /etc/update-motd.d ]]; then
         chmod -x /etc/update-motd.d/* 2>/dev/null || true
     fi
