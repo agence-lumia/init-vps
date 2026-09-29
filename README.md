@@ -6,7 +6,7 @@
 
 Un seul script bash, 100 % interactif, idempotent — du serveur nu au serveur durci et prêt à déployer.
 
-[![Lint](https://github.com/studiokyne/init-vps/actions/workflows/lint.yml/badge.svg)](https://github.com/studiokyne/init-vps/actions/workflows/lint.yml)
+[![Lint](https://github.com/agence-lumia/init-vps/actions/workflows/lint.yml/badge.svg)](https://github.com/agence-lumia/init-vps/actions/workflows/lint.yml)
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-blue.svg)](LICENSE)
 [![Shell: bash](https://img.shields.io/badge/Shell-bash-121011.svg?logo=gnu-bash&logoColor=white)](init-vps.sh)
 [![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04_LTS-E95420.svg?logo=ubuntu&logoColor=white)](https://ubuntu.com)
@@ -40,14 +40,14 @@ Un seul script bash, 100 % interactif, idempotent — du serveur nu au serveur d
 ### Commande unique (recommandée)
 
 ```bash
-curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
+curl -fsSL https://github.com/agence-lumia/init-vps/releases/latest/download/init-vps.sh \
   -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh
 ```
 
 ### Clone + exécution locale
 
 ```bash
-git clone https://github.com/studiokyne/init-vps.git
+git clone https://github.com/agence-lumia/init-vps.git
 cd init-vps
 sudo ./init-vps.sh
 ```
@@ -74,7 +74,7 @@ Alternative — premier passage à cette version, ou `vps-helper` trop ancien po
 connaître `self-update` :
 
 ```bash
-curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
+curl -fsSL https://github.com/agence-lumia/init-vps/releases/latest/download/init-vps.sh \
   -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh --update
 ```
 
@@ -283,4 +283,4 @@ La version installée sur un serveur est accessible via `vps-helper version`, qu
 
 ## 📄 Licence
 
-[MIT](LICENSE) — © 2026 Studio Kyne and contributors
+[MIT](LICENSE) — © 2026 Lümia and contributors

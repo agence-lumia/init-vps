@@ -6,7 +6,9 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
 
 À l'exécution, `init-vps.sh` génère des sous-scripts sur le serveur cible via des heredocs :
 
-- **MOTD** (`/etc/update-motd.d/00-studiokyne`) — délimité par `MOTDEOF`
+- **MOTD** (`/etc/update-motd.d/00-lumia`) — délimité par `MOTDEOF`. S'appelait
+  `00-studiokyne` : `step_motd` retire l'ancien fichier **après** avoir installé le
+  nouveau (même schéma que `99-swap.conf`), sinon `run-parts` afficherait deux MOTD.
 - **vps-helper** (`/usr/local/bin/vps-helper`) — délimité par `HELPEREOF`
 - **apply.sh** (`/usr/local/lib/docker-user/apply.sh`) — délimité par `APPLYEOF`
 - **vps-notify** (`/usr/local/bin/vps-notify`) — délimité par `NOTIFYEOF`
@@ -369,7 +371,7 @@ miroir est sans effet ; il protège le jour où `"ipv6": true` est activé.
 ### Versions, dépôt des releases et `vps-helper self-update`
 
 **Dépôt jamais écrit en dur dans la logique.** `INIT_VPS_REPO` (tête du parent,
-`studiokyne/init-vps` sur `main`) est remplacé à la publication par
+`agence-lumia/init-vps` sur `main`) est remplacé à la publication par
 `${{ github.repository }}` (`auto-release.yml`, même motif `0,/…/` et même
 garde-fou `grep -q` que `SCRIPT_VERSION`) : une release publiée depuis un autre
 dépôt pointe d'elle-même vers lui. `step_vps_helper` l'injecte dans
@@ -569,7 +571,7 @@ Pour vérifier qu'un ESC réel est généré (octet `0x1B`, affiché `^[` par `c
 ```bash
 ./init-vps.sh 2>/dev/null | cat -v   # ne fonctionne pas en interactif
 # Tester directement le sous-script :
-bash /etc/update-motd.d/00-studiokyne | cat -v
+bash /etc/update-motd.d/00-lumia | cat -v
 vps-helper check | cat -v
 ```
 

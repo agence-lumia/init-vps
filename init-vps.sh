@@ -76,7 +76,7 @@ SCRIPT_VERSION="0.0.0-dev"
 # Dépôt des releases (self-update, nouvelles versions). Remplacé à la
 # publication par le dépôt qui publie (auto-release.yml) : ne l'écrire en dur
 # nulle part ailleurs dans la logique.
-INIT_VPS_REPO="studiokyne/init-vps"
+INIT_VPS_REPO="agence-lumia/init-vps"
 LOG_FILE="/var/log/init-vps.log"
 SSHD_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 STATE_DIR="/etc/init-vps"
@@ -1409,11 +1409,11 @@ step_motd() {
     fi
 
     mkdir -p /etc/update-motd.d
-    backup_file /etc/update-motd.d/00-studiokyne
+    backup_file /etc/update-motd.d/00-lumia
     # Écrit à côté puis renommé (voir CLAUDE.md, « Écriture des fichiers
     # générés ») ; run-parts ignore les noms commençant par un point.
     local motd_tmp
-    motd_tmp="$(mktemp /etc/update-motd.d/.00-studiokyne.XXXXXX)"
+    motd_tmp="$(mktemp /etc/update-motd.d/.00-lumia.XXXXXX)"
     cat > "$motd_tmp" <<'MOTDEOF'
 #!/usr/bin/env bash
 # MOTD — généré par init-vps.sh, design uniforme à chaque connexion.
@@ -1492,7 +1492,16 @@ printf "\n  ${C_DIM}Administration du serveur :${C_RESET} ${C_BOLD}vps-helper${C
 printf '\n'
 MOTDEOF
     chmod 755 "$motd_tmp"
-    mv -f "$motd_tmp" /etc/update-motd.d/00-studiokyne
+    mv -f "$motd_tmp" /etc/update-motd.d/00-lumia
+
+    # Migration : ce script s'appelait 00-studiokyne. Le laisser afficherait le
+    # MOTD deux fois (run-parts exécute les deux). Retiré APRÈS l'installation
+    # du nouveau : aucune connexion ne se fait sans MOTD. Sauvegardé comme le reste.
+    if [[ -f /etc/update-motd.d/00-studiokyne ]]; then
+        backup_file /etc/update-motd.d/00-studiokyne
+        rm -f /etc/update-motd.d/00-studiokyne
+        log_info "Ancien /etc/update-motd.d/00-studiokyne retiré (remplacé par 00-lumia)."
+    fi
 
     # Sur Ubuntu 24.04, pam_motd.so est configuré avec noupdate par défaut :
     # les scripts update-motd.d ne sont exécutés qu'au boot, pas à chaque login.
@@ -1675,10 +1684,10 @@ EOF
 }
 
 cmd_status() {
-    if [[ -x /etc/update-motd.d/00-studiokyne ]]; then
-        /etc/update-motd.d/00-studiokyne
+    if [[ -x /etc/update-motd.d/00-lumia ]]; then
+        /etc/update-motd.d/00-lumia
     else
-        err "Script de statut introuvable (/etc/update-motd.d/00-studiokyne)."
+        err "Script de statut introuvable (/etc/update-motd.d/00-lumia)."
         exit 1
     fi
 }
