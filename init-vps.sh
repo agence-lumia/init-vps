@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
 # init-vps.sh — Initialisation et durcissement VPS (100% interactif)
-# Cible : Ubuntu / Debian (testé sur Ubuntu 24.04 LTS, sans verrou de version
+# Cible : Ubuntu / Debian (testé sur Ubuntu 24.04 et 26.04 LTS, sans verrou de version
 #         pour rester compatible avec les futures releases LTS)
 #
 # USAGE (commande unique) :

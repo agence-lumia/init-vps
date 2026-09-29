@@ -240,3 +240,39 @@ Avertissements propres à 26.04 dans les logs :
 - Cycle complet du redémarrage automatique, envoi vps-notify (python3 3.14).
 - Liaison Dokploy : le manager installe **Dokploy v0.30.8**, postérieure à la v0.29.0
   qui accepte un utilisateur non-root.
+
+## 7. Étape 4 — validation de la branche `ubuntu-26.04-remote`
+
+**Verdict 26.04 : GO.** Aucune erreur d'init-vps propre à 26.04 ; les défauts
+trouvés (tous corrigés) valaient aussi pour 24.04, sauf `timestamp_type` refusé
+par sudo-rs, contourné par une variante validée par `visudo -cf`.
+
+| Test | 26.04 | 24.04 |
+|---|---|---|
+| Installation neuve rôle 1 (manager) | code 0, `check` 0 FAIL | code 0, `check` 0 FAIL |
+| Installation neuve rôle 2 (remote) | code 0, `check` 0 FAIL, 7 contrôles d'accès au vert | idem |
+| Mise à jour release 2026.09.15.4 → branche | code 0, MOTD sans doublon, questions posées une fois, 2e `--update` sans effet | code 0 (manager) |
+| Port 3000 | fermé par défaut, injoignable depuis Internet, panneau servi par tunnel SSH (HTTP 307) | idem |
+| KexAlgorithms | `mlkem768x25519-sha256` en tête, `sshd -t` OK, négocié par OpenSSH 10.5 | `sntrup761…@openssh.com` en tête, `sshd -t` OK |
+| `check` → 1 | `vps-check.service` : `Result=success`, aucune unit failed, un seul message webhook pour deux audits identiques, « revenu au vert » ensuite | — |
+| Liaison Dokploy v0.30.8 (par IP privée, utilisateur `dokploy`) | Setup Server (« Already part of a Docker Swarm »), Validate : Privilege Mode et Docker Group au vert ; WordPress déployé en HTTPS | — |
+| Changement d'IP publique du remote (Primary IP) | swarm sur 10.0.0.2 inchangé, site revenu seul (HTTP 200, certificat valide), `check` 0 FAIL | — |
+
+Défauts trouvés pendant l'étape 4, corrigés et revérifiés :
+
+- `motd-news.service`, puis `motd-news.timer`, en échec après une installation
+  neuve (ordre chmod / arrêt / masquage) — course déjà présente dans la release ;
+- cadre du MOTD et bannière décalés de 2 et 1 colonnes ;
+- Setup Server de Dokploy : swarm annoncé sur l'IP publique, resté sur une adresse
+  morte après changement d'IP → swarm désormais initialisé par init-vps sur l'IP
+  privée ;
+- `reboot-status` affichait une planification devenue caduque.
+
+Non couvert, abandonné à la demande de Nolan : l'endurance de 48 h (cycles réels
+des timers d'audit, d'unattended-upgrades et de la fenêtre de redémarrage). Le
+redémarrage manuel des remotes a été vérifié (conteneurs revenus, `check` vert).
+
+Constats côté Dokploy, hors init-vps : l'onglet *Security* affiche deux faux
+positifs (voir CLAUDE.md) ; les fichiers montés d'un compose ne sont écrits qu'à la
+création ou modification d'un montage, jamais au déploiement — un remote reconstruit
+redéploie donc avec des dossiers vides à la place des fichiers.
