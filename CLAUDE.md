@@ -9,6 +9,10 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
 - **MOTD** (`/etc/update-motd.d/00-lumia`) — délimité par `MOTDEOF`. S'appelait
   `00-studiokyne` : `step_motd` retire l'ancien fichier **après** avoir installé le
   nouveau (même schéma que `99-swap.conf`), sinon `run-parts` afficherait deux MOTD.
+  `motd-news` est neutralisé **avant** le `chmod -x` des scripts Ubuntu
+  (`mask --now` du timer, `ENABLED=0`, `reset-failed`) : dans l'ordre inverse, un
+  déclenchement du timer entre les deux laissait `motd-news.service` en échec
+  (203/EXEC), remonté en FAIL par `check` (mesuré sur une installation neuve 26.04).
 - **vps-helper** (`/usr/local/bin/vps-helper`) — délimité par `HELPEREOF`
 - **apply.sh** (`/usr/local/lib/docker-user/apply.sh`) — délimité par `APPLYEOF`
 - **vps-notify** (`/usr/local/bin/vps-notify`) — délimité par `NOTIFYEOF`

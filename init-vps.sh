@@ -1567,10 +1567,20 @@ step_motd() {
 
     # Désactive les scripts MOTD par défaut d'Ubuntu (news, pubs ESM, alertes
     # de fin de support...) pour ne garder qu'un affichage propre et uniforme.
+    # motd-news d'abord, les chmod ensuite : si motd-news.timer se déclenchait
+    # entre les deux, son service exécutait un 50-motd-news déjà non exécutable
+    # et restait en échec (203/EXEC) — mesuré sur une installation neuve 26.04,
+    # remonté en FAIL par `check`. mask plutôt que disable : une mise à jour du
+    # paquet ne le réactive pas. ENABLED=0 est le réglage prévu par Ubuntu.
+    systemctl mask --now motd-news.timer >/dev/null 2>&1 || true
+    systemctl stop motd-news.service >/dev/null 2>&1 || true
+    if [[ -f /etc/default/motd-news ]]; then
+        sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+    fi
+    systemctl reset-failed motd-news.service >/dev/null 2>&1 || true
     if [[ -d /etc/update-motd.d ]]; then
         chmod -x /etc/update-motd.d/* 2>/dev/null || true
     fi
-    systemctl disable --now motd-news.timer >/dev/null 2>&1 || true
     : > /etc/motd 2>/dev/null || true
 
     # /etc/legal (notice « free software / NO WARRANTY ») est affiché à chaque
