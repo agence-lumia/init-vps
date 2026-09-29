@@ -397,8 +397,8 @@ print_banner() {
     cat <<'EOF'
 
   ┌──────────────────────────────────────────────────┐
-  │   INIT-VPS — Initialisation & durcissement VPS    │
-  │   Ubuntu / Debian · prêt pour Dokploy             │
+  │   INIT-VPS — Initialisation & durcissement VPS   │
+  │   Ubuntu / Debian · prêt pour Dokploy            │
   └──────────────────────────────────────────────────┘
 
 EOF
@@ -1666,7 +1666,9 @@ fi
 
 printf '\n'
 printf "${C_CYAN}  ┌──────────────────────────────────────────────────┐${C_RESET}\n"
-printf "${C_CYAN}  │${C_RESET} ${C_BOLD}%-51s${C_RESET}${C_CYAN}│${C_RESET}\n" "${HOSTNAME_VAL}"
+# Cadre de 50 colonnes intérieures : « │ » + espace + 49 + « │ ». %-51s débordait
+# de 2 colonnes ; .49 tronque un hostname plus long (RFC 1123 : jusqu'à 63).
+printf "${C_CYAN}  │${C_RESET} ${C_BOLD}%-49.49s${C_RESET}${C_CYAN}│${C_RESET}\n" "${HOSTNAME_VAL}"
 printf "${C_CYAN}  └──────────────────────────────────────────────────┘${C_RESET}\n"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Système"   "${OS_PRETTY} (${KERNEL})"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Uptime"    "${UPTIME_VAL}"
