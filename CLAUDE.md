@@ -6,7 +6,15 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
 
 À l'exécution, `init-vps.sh` génère des sous-scripts sur le serveur cible via des heredocs :
 
-- **MOTD** (`/etc/update-motd.d/00-studiokyne`) — délimité par `MOTDEOF`
+- **MOTD** (`/etc/update-motd.d/00-lumia`) — délimité par `MOTDEOF`. S'appelait
+  `00-studiokyne` : `step_motd` retire l'ancien fichier **après** avoir installé le
+  nouveau (même schéma que `99-swap.conf`), sinon `run-parts` afficherait deux MOTD.
+  `motd-news` est neutralisé **avant** le `chmod -x` des scripts Ubuntu
+  (arrêt du timer PUIS `mask`, `ENABLED=0`, `reset-failed`) : dans l'ordre inverse, un
+  déclenchement du timer entre les deux laissait `motd-news.service` en échec
+  (203/EXEC), remonté en FAIL par `check` (mesuré sur une installation neuve 26.04).
+  Et le timer est **arrêté avant** d'être masqué : masqué encore actif, il
+  échoue au `daemon-reload` suivant (« Unit to trigger vanished »), mesuré aussi.
 - **vps-helper** (`/usr/local/bin/vps-helper`) — délimité par `HELPEREOF`
 - **apply.sh** (`/usr/local/lib/docker-user/apply.sh`) — délimité par `APPLYEOF`
 - **vps-notify** (`/usr/local/bin/vps-notify`) — délimité par `NOTIFYEOF`
@@ -108,13 +116,56 @@ Côté vps-helper : `cmd_docker_firewall` (`status|apply|clear`, dans
 `clear` est le filet de sécurité si les règles cassent un service en production.
 Le heredoc `APPLYEOF` est validé par une porte dédiée dans `lint.yml`.
 
+#### Panneau Dokploy (3000/tcp) : jamais ouvert à tout Internet
+
+**Un Dokploy neuf laisse le premier visiteur créer le compte propriétaire.**
+Le port 3000 n'est donc jamais ouvert à tout Internet :
+
+| `DOKPLOY_RESTRICT_IP` | Port 3000 |
+|---|---|
+| IP ou CIDR ≥ /8 | ouvert à elle seule (UFW **et** DOCKER-USER), jusqu'à `close-dokploy` |
+| vide (défaut) | fermé — accès par `ssh -L 3000:127.0.0.1:3000 admin@IP` (`dokploy_tunnel_hint`), rappelé par `step_ufw_base` et le résumé |
+
+`validate_dokploy_restrict_ip` refuse un masque < /8 (`0.0.0.0/0` reviendrait à
+tout ouvrir) ; `dokploy_ui_source` ignore une telle valeur venue de `config.env`,
+et `apply.sh` la refuse à son tour. ⚠️ Un serveur installé par une ancienne
+version avec le port ouvert à tous, sans restriction : un `--update` le **ferme**
+(`step_ufw_base` retire toute règle 3000 avant de décider). C'est voulu.
+
+Historique : la release 2026.09.15.4 ouvrait 3000 dans UFW à tous, mais le DROP
+de `DOCKER-USER` bloquait le port (UFW ne voit pas un port publié par Docker) :
+le panneau était injoignable. Le correctif ne l'ouvre plus qu'à l'IP restreinte.
+
+- `dokploy_ui_source()` est la **seule** décision (IP/CIDR ou vide). `step_ufw_base`
+  et `step_docker_user_firewall` la lisent tous les deux.
+- `step_docker_user_firewall` l'écrit dans `/usr/local/lib/docker-user/dokploy-ui` ;
+  `apply.sh` la revalide et ajoute `-s <IP> --dport 3000 -j RETURN` avant le DROP.
+  Toute autre valeur (dont l'ancien `any`) laisse le port bloqué. Pas de miroir v6.
+- `vps-helper close-dokploy` supprime le fichier et relance `apply.sh` (si la
+  chaîne porte nos règles).
+- `check` : un port publié derrière nos règles n'est plus un FAIL (il est
+  bloqué, INFO). FAIL seulement si la chaîne est vide ; WARN si le filtrage vient
+  de règles tierces. Le port 3000 ouvert à l'IP restreinte donne une INFO, qui
+  devient WARN si `acme.json` contient déjà un domaine.
+
+#### Pare-feu Hetzner (Cloud Firewall)
+
+Invisible depuis le serveur, on ne peut que le **rappeler** : avec une IP
+restreinte, `step_ufw_base` et le résumé demandent d'y autoriser 3000/tcp depuis
+cette IP le temps de configurer le domaine, puis `close-dokploy` rappelle de
+l'en retirer. Il **ne filtre pas le
+réseau privé** (FAQ Hetzner : « we consider the private networks to be
+'secure' ») : un manager qui joint son remote par IP privée n'a besoin d'aucune
+règle Hetzner. Une IP de manager **publique** déclenche un rappel dans le résumé.
+
 ### `dokploy_port_is_open()` a deux sources de vérité
 
-UFW **ou** un conteneur publiant `0.0.0.0:3000->`. Ni l'une ni l'autre ne
-suffit : `$DOKPLOY_PORT_CLOSED` ignore un `ufw delete` manuel, et UFW ignore les
-ports publiés par Docker. Sur le serveur diagnostiqué, `vps-helper check`
-annonçait « Port 3000 : fermé » pendant que docker-proxy écoutait sur
-`0.0.0.0:3000`.
+UFW **ou** le port réellement joignable côté Docker, c'est-à-dire publié
+(`docker ps` / `docker service ls`) **et** laissé passer par DOCKER-USER
+(fichier `dokploy-ui` présent, ou chaîne vide). Ni l'une ni l'autre ne suffit :
+`$DOKPLOY_PORT_CLOSED` ignore un `ufw delete` manuel, et UFW ignore les ports
+publiés par Docker. Sur le serveur diagnostiqué, `vps-helper check` annonçait
+« Port 3000 : fermé » pendant que docker-proxy écoutait sur `0.0.0.0:3000`.
 
 ### `configure_needrestart()` s'exécute avant l'étape 1
 
@@ -210,7 +261,7 @@ conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
 | `oom_kill > 0` | FAIL |
 | `max > 0`, `memory.stat` illisible | FAIL |
 | `max > 0`, `pgsteal / max < 16` | FAIL « sans mémoire récupérable » |
-| `max > 0`, `pgmajfault > 100` et `> max / 10` | FAIL « thrashing » |
+| `max > 0`, `pgmajfault > 1000` et `> max / 10` | FAIL « thrashing » (swap du conteneur affiché) |
 | sinon | INFO, puis logique d'âge habituelle |
 
 `pgsteal` et `pgmajfault` sont lus en correspondance exacte (`$1 == "pgsteal"`) :
@@ -224,10 +275,31 @@ un motif lâche prendrait `pgsteal_direct`.
 - **`workingset_refault_file`** : 374 007 sur le cas sain (`wp` relit ses fichiers
   PHP à chaque cycle).
 
-⚠️ Le garde-fou `pgmajfault` (`MEM_MAJFAULT_FLOOR=100`) est **provisoire** : il
-vise l'incident historique (code PHP mappé évincé sans OOM — `pgsteal` non nul,
-`pgmajfault` élevé), jamais mesuré avec ces compteurs. Méthode de test
-reproductible (~1 min) :
+**OOM de cgroup : attention à la casse.** Le noyau écrit « `Out of memory: Killed
+process` » pour un OOM global, mais « `Memory cgroup out of memory: Killed process` »
+(o minuscule, `mm/oom_kill.c`) pour un OOM de cgroup. L'ancien filtre sur
+`Out of memory` perdait tous les OOM de cgroup, d'où un faux PASS. Le motif
+`[Oo]ut of memory` couvre les deux formes.
+
+Garde-fou `pgmajfault` : `MEM_MAJFAULT_FLOOR=1000` (29/09/2026). Il vise l'incident
+historique (code PHP mappé évincé sans OOM : `pgsteal` non nul, `pgmajfault` élevé).
+Plancher mesuré 3 jours après un reboot, sur 15 conteneurs :
+
+- bruit de fond : 19 à 311 majfaults (binaire et bibliothèques chargés à froid) ; à
+  100, un nginx à 135 pour 328 reclaims de cache bénins tombait en FAIL ;
+- vrais cas : wordpress (PHP-FPM) à 39 032 et 94 385, limite 1G saturée
+  (`memory.peak` = `memory.max`).
+
+⚠️ **`pgmajfault` compte aussi les retours depuis le swap**, pas seulement le code
+relu depuis le disque. Or **Docker accorde par défaut à chaque conteneur autant de
+swap que sa limite mémoire** : `memory.swap.max` = `memory.max` quand
+`--memory-swap` n'est pas fixé. Mesuré sur Docker 29.8.1, aussi bien pour un
+`docker run --memory 64m` que pour un service Swarm `--limit-memory 64m` (cas des
+déploiements Dokploy). Un conteneur à sa limite pagine donc dans le swap de l'hôte
+au lieu d'être tué : le message de thrashing affiche `memory.swap.current` pour
+le distinguer.
+
+Méthode de test reproductible (~1 min) :
 
 1. `docker update --memory 128m --memory-swap 128m <cron>`, puis `docker restart <cron>` ;
 2. `docker exec <cron> wp cron event run wp_version_check wp_update_plugins wp_update_themes` ;
@@ -246,6 +318,11 @@ Les fonctions `check_*` incrémentent `pass`/`fail` de `cmd_check` par portée
 dynamique ; `chk_fail` mémorise aussi le message dans `CHK_FAIL_MSGS` (utilisé
 par `--notify`), `chk_warn` compte les avertissements sans faire échouer.
 
+`vps-helper check` **sort en 1 dès qu'un contrôle échoue** (il sortait toujours
+en 0). `vps-check.service` porte donc `ExecStart=-…` : sans le tiret, chaque
+audit en échec laisserait une unit « failed » de plus, que `check` signalerait
+le lendemain.
+
 ### Port SSH (`SSH_PORT`) — configurable, changement sans verrouillage
 
 `SSH_PORT` n'est plus une constante : `collect_ssh_port`, persisté dans
@@ -259,7 +336,23 @@ terminal, puis fermer l'ancien.
 - Serveur **déjà verrouillé** : `ssh_port_migration`. Un refus ne quitte pas le
   script, il revient à l'ancien port (`ssh_revert_port` réaligne UFW, fail2ban
   et `$SSH_PORT`, que `step_save_state` persistera).
-- `write_sshd_final_config` est la **seule** source du contenu verrouillé.
+- `write_sshd_final_config` est la **seule** source du contenu verrouillé
+  (`sshd_final_config_content`). Serveur déjà verrouillé, port inchangé :
+  `ssh_refresh_final_config` réécrit le fichier **si son contenu a changé**, et
+  remet l'ancien si `sshd -t` refuse le nouveau. Avant, un `--update` ne
+  propageait aucune modification de ce fichier.
+- `AllowUsers` = `sshd_allow_users` : le compte admin, plus `dokploy@<IP_MANAGER>`
+  en rôle remote. `vps-helper manager` ne réécrit que cette ligne, et produit la
+  même chose.
+- `KexAlgorithms` = `ssh_kex_algorithms` : post-quantiques en tête
+  (`mlkem768x25519-sha256`, `sntrup761x25519-sha512`), filtrés par `ssh -Q kex`.
+  Une liste fixe serait refusée par `sshd -t` d'un côté ou de l'autre (ML-KEM :
+  OpenSSH ≥ 9.9, donc 26.04 mais pas 24.04). Sans eux, tout client OpenSSH ≥ 10
+  affiche « connection is not using a post-quantum key exchange algorithm ».
+- `test_sshd_config` crée `/run/sshd` avant `sshd -t`. Sur 24.04, ce répertoire
+  n'existe que tant que `ssh.service` tourne (`RuntimeDirectory`) ; needrestart
+  l'arrête pendant le dist-upgrade. Mesuré : première installation arrêtée sur
+  « Missing privilege separation directory ». 26.04 le crée par tmpfiles.d.
 
 ⚠️ Ubuntu 24.04 : sshd est **activé par socket**, et le port d'écoute vient d'un
 générateur systemd qui ne relit `sshd_config` qu'au `daemon-reload`. Un
@@ -330,6 +423,13 @@ directement, pour un redémarrage déjà requis au moment de l'installation.
 Dates de report calculées « date + 1 day » (et non +86400) : juste au passage
 à l'heure d'hiver. `check` garde le FAIL au-delà de 7 jours (reports répétés).
 
+⚠️ `reboot_postpone` calcule le **jour** suivant, puis y colle l'heure :
+`date -d "$(date -d "$day +1 day" +%F) $hm"`. **Jamais**
+`date -d "AAAA-MM-JJ HH:MM +1 day"` : GNU date lit ce `+1` comme un décalage de
+fuseau (UTC+1). Mesuré sur 24.04 : report à 05:00 au lieu de 04:00 en été à
+Paris, 03:00 sur un serveur en UTC. uutils (26.04) donnait 04:00. La forme
+retenue donne le même résultat sur les deux, changements d'heure compris.
+
 `check_system` couvre ce que rien ne signalait : units en échec, disques ≥ 80 %
 (WARN) / ≥ 90 % (FAIL), reboot en attente > 7 jours (FAIL), erreurs de la
 **dernière** exécution d'unattended-upgrades.
@@ -369,7 +469,7 @@ miroir est sans effet ; il protège le jour où `"ipv6": true` est activé.
 ### Versions, dépôt des releases et `vps-helper self-update`
 
 **Dépôt jamais écrit en dur dans la logique.** `INIT_VPS_REPO` (tête du parent,
-`studiokyne/init-vps` sur `main`) est remplacé à la publication par
+`agence-lumia/init-vps` sur `main`) est remplacé à la publication par
 `${{ github.repository }}` (`auto-release.yml`, même motif `0,/…/` et même
 garde-fou `grep -q` que `SCRIPT_VERSION`) : une release publiée depuis un autre
 dépôt pointe d'elle-même vers lui. `step_vps_helper` l'injecte dans
@@ -421,6 +521,22 @@ fichier : ignoré. La copie vers un temporaire précède tout renommage, car pen
 un `--rollback` le script qui tourne **est** `init-vps.prev.sh` ; après un
 rollback, les deux copies sont simplement permutées.
 
+### sudo du compte admin — sudo-rs sur 26.04
+
+`step_admin_sudo` écrit `/etc/sudoers.d/10-admin-timestamp`
+(`Defaults:<admin> timestamp_timeout=30, timestamp_type=global`). Sur 26.04,
+`sudo` est **sudo-rs** (0.2.13), qui **ne connaît pas `timestamp_type`** :
+`visudo -cf` le refuse (« unknown setting »), et `sudoers-rs(5)` précise qu'il
+tient un horodatage **par terminal**. L'étape essaie donc les variantes dans
+l'ordre et installe la première que `visudo -cf` accepte : sur 26.04,
+`timestamp_timeout=30` seul (une saisie par terminal) ; sur 24.04, les deux.
+**Jamais** un fichier non validé. Même méthode que `90-dokploy` : temporaire
+nommé avec un point dans `sudoers.d` (ignoré par sudo et sudo-rs, mesuré), 0440,
+puis `mv`.
+
+À savoir : un réglage inconnu déposé quand même **ne bloque pas** sudo-rs (erreur
+affichée, commande exécutée — mesuré), mais on ne s'appuie pas là-dessus.
+
 ### Rôle du serveur (`SERVER_ROLE`) — manager vs remote server
 
 `collect_server_role()` demande, tôt dans la collecte (juste après `collect_swap`, avant les questions Dokploy), si ce serveur est :
@@ -430,9 +546,90 @@ rollback, les deux copies sont simplement permutées.
 
 `show_recap()` et `print_summary()` adaptent leur affichage selon `SERVER_ROLE` (pas de ligne « Dokploy » pour un remote server). **Ne pas dupliquer la logique d'installation Dokploy** dans la branche remote — elle reste entièrement dans `step_dokploy`/`step_traefik_tuning`, simplement non appelées.
 
+### Rôle remote : accès du manager Dokploy (issue #1)
+
+Dokploy ≥ v0.29.0 (PR Dokploy #4059, issue Dokploy #1126) pilote un remote avec
+un utilisateur **non-root**. Ce que vérifie son « Validate »
+(`packages/server/src/setup/server-validate.ts`) : `sudo -n true` réussit
+(« Privilege Mode »), et `groups` contient `docker` (« Docker Group »). Son
+script de mise en place (`server-setup.ts`) teste `$EUID` : le shell doit être
+**bash**.
+
+- **Collecte** (`collect_manager`, rôle 2 seulement) : IP du manager
+  (`validate_manager_ip`, IPv4, privée acceptée, vide = plus tard) puis clé
+  publique générée dans Dokploy (`validate_dokploy_pubkey`). `MANAGER_IP` va dans
+  `config.env` ; la clé **uniquement** dans `authorized_keys` (`DOKPLOY_MANAGER_KEY`,
+  en mémoire). ⚠️ `validate_dokploy_pubkey` refuse explicitement `
+`/`
+` :
+  dans une regex bash, `.` matche le saut de ligne, et « clé
+autre-clé »
+  ajouterait une seconde clé **sans** `from=`.
+- **Toute la logique vit dans `vps-helper manager`** (même schéma que
+  `step_traefik_tuning`) : `step_dokploy_remote` l'appelle après `ensure_docker`
+  (le groupe docker doit exister). La même commande sert à changer de manager :
+  `sudo vps-helper manager --ip <IP> [--key "<clé>"]`, sans argument = état.
+  Sans `--key`, la clé en place est gardée et son `from=` réaligné (cas d'un
+  `--update`, où la clé n'est plus connue).
+- Compte `dokploy` : système, `/bin/bash`, groupe `docker`, mot de passe `*`
+  (inutilisable, mais pas « verrouillé » au sens de sshd, contrairement à `!`).
+- `/etc/sudoers.d/90-dokploy` : `dokploy ALL=(ALL) NOPASSWD:ALL`, écrit dans
+  `.90-dokploy.XXXXXX` (sudo ignore les noms contenant un point), validé par
+  `visudo -cf`, installé en 0440. Rien d'installé si la validation échoue.
+- `authorized_keys` : **uniquement** `from="<IP_MANAGER>" <clé>`.
+- sshd : `AllowUsers <admin> dokploy@<IP_MANAGER>` ; `PermitRootLogin no`
+  inchangé ; `sshd -t` avant rechargement, ancien fichier remis en cas de refus.
+- UFW : `allow from <IP> to any port <SSH_PORT> proto tcp`, commentaire
+  `SSH Dokploy manager`, **inséré avant** la règle `limit` (sinon la limite de
+  débit coupe les déploiements, qui ouvrent beaucoup de connexions SSH). Toute
+  règle portant ce commentaire avec une autre IP ou un autre port est retirée.
+- fail2ban : IP ajoutée à `ignoreip`, ancienne IP (`config.env`) retirée, reste
+  de la ligne conservé.
+- `check_dokploy_remote` (section « Accès du manager Dokploy ») : compte + bash,
+  groupe docker, sudoers valide **et** `runuser -u dokploy -- sudo -n true`,
+  chaque clé derrière `from="IP"`, `AllowUsers`, règle UFW avant la limite,
+  `ignoreip` (WARN).
+- **Swarm sur l'IP privée** (`step_remote_swarm`, avant `step_dokploy_remote`) :
+  le Setup Server de Dokploy initialise le swarm avec l'**IP publique**
+  (`server-setup.ts`, `get_ip` via ifconfig.io). Mesuré le 29/09/2026 : IP
+  publique du remote remplacée par une autre Primary IP → le site revient seul
+  et un service Swarm se planifie encore (nœud unique), mais le nœud reste
+  annoncé (`NodeAddr`, pairs de `dokploy-network`) sur une adresse qui n'existe
+  plus — tout ajout de nœud ou trafic overlay entre nœuds casserait. init-vps
+  fait donc `docker swarm init --advertise-addr <IP privée>` avant le Setup, qui
+  trouve le swarm actif et saute le sien. IP détectée par `detect_private_addr`
+  (source de la route vers le manager, sinon 1re IPv4 privée hors Docker),
+  confirmée à l'installation (`collect_remote_swarm_addr`, validée présente sur
+  le serveur), persistée dans `ADVERTISE_ADDR`. Pas de `--listen-addr` : il
+  dépendrait de l'ordre d'apparition des interfaces au boot (2377 reste fermé
+  par UFW). Swarm déjà actif ailleurs : **jamais** corrigé automatiquement
+  (`docker swarm leave --force` supprimerait services et réseaux) ; `check` le
+  signale — FAIL si l'adresse n'est plus sur le serveur, WARN si publique.
+  Correction manuelle : `docker swarm leave --force`, `docker swarm init
+  --advertise-addr <IP privée>`, puis « Setup Server » dans Dokploy et
+  redéploiement des applications.
+- **Onglet « Security » de Dokploy : faux positifs connus**, ne rien changer
+  (`packages/server/src/setup/server-audit.ts`, v0.30.8) :
+  - *Password Auth « Enabled »* : Dokploy ne lit que `/etc/ssh/sshd_config`
+    (`grep ^PasswordAuthentication`, défaut « yes » si absent), jamais
+    `sshd_config.d/99-hardening.conf`. Valeur effective : `sshd -T` →
+    `passwordauthentication no`.
+  - *Fail2Ban « SSH Protection Not Enabled »* : il lit
+    `grep -A10 "^\[sshd\]" jail.local | grep enabled`. Chez nous, `[recidive]`
+    commence dans ces 10 lignes : il obtient « truetrue » au lieu de « true »
+    (reproduit). Valeur effective : `fail2ban-client status sshd`, jail active.
+  - *Use PAM « Enabled »* : pas un faux positif, un choix. `UsePAM yes` (défaut
+    Ubuntu) fait passer le MOTD (`pam_motd`) et les sessions logind ; avec
+    `PasswordAuthentication no` et `KbdInteractiveAuthentication no`, PAM
+    n'ouvre aucune porte.
+- Résumé : l'étape « Ajouter au manager » donne l'IP par laquelle le manager
+  joint ce serveur (`ip route get <IP_MANAGER>` → `src`, donc la privée sur un
+  réseau Hetzner), le port, l'utilisateur `dokploy`. Elle disparaît une fois
+  `/etc/dokploy` présent (créé par le « Setup Server » de Dokploy).
+
 ### Mode mise à jour (`--update` / `/etc/init-vps/config.env`)
 
-`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `DOKPLOY_PORT_CLOSED`, `SSH_PORT`, `NOTIFY_ENABLED`, `AUTO_REBOOT`, `AUTO_REBOOT_TIME`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`. **Aucun secret non plus** (URL de webhook : `notify.env`, 600) — ce fichier est `source`-é, toute valeur saisie qui y finit doit passer un validateur au jeu de caractères restreint.
+`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `DOKPLOY_PORT_CLOSED`, `MANAGER_IP`, `SSH_PORT`, `NOTIFY_ENABLED`, `AUTO_REBOOT`, `AUTO_REBOOT_TIME`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`. **Aucun secret non plus** (URL de webhook : `notify.env`, 600) — ce fichier est `source`-é, toute valeur saisie qui y finit doit passer un validateur au jeu de caractères restreint.
 
 **Nouvelles options et mode mise à jour** : `ask_new_options` pose, et seulement elles, les questions dont la clé est **absente** de `config.env` (`state_has`) — une option apparue après le provisionnement du serveur. Un refus est persisté (`"0"`) et n'est plus jamais reposé. Exception : une option acceptée dont le fichier de secret a disparu est reproposée. Toute future option suit ce schéma : variable vide par défaut, clé dans `step_save_state`, entrée dans `ask_new_options`.
 
@@ -449,7 +646,8 @@ Chaque étape n'est affichée que si elle est **encore à faire**, sondée sur l
 | Vérifier la connexion SSH | `UPDATE_MODE = 0` (une relance passe déjà par SSH) |
 | Pointer un domaine / configurer le TLS | `dokploy_has_tls_domain` faux |
 | Fermer le port 3000 | `dokploy_port_is_open` vrai |
-| Ajouter au manager | rôle remote |
+| Configurer le manager (`vps-helper manager`) | rôle remote, `MANAGER_IP` vide |
+| Ajouter au manager (IP, port, utilisateur `dokploy`) | rôle remote, `/etc/dokploy` absent |
 
 Les lignes d'en-tête suivent la même règle — **elles rapportent l'état réel, pas la valeur
 demandée** :
@@ -569,7 +767,7 @@ Pour vérifier qu'un ESC réel est généré (octet `0x1B`, affiché `^[` par `c
 ```bash
 ./init-vps.sh 2>/dev/null | cat -v   # ne fonctionne pas en interactif
 # Tester directement le sous-script :
-bash /etc/update-motd.d/00-studiokyne | cat -v
+bash /etc/update-motd.d/00-lumia | cat -v
 vps-helper check | cat -v
 ```
 

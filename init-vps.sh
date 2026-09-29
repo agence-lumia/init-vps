@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
 # init-vps.sh — Initialisation et durcissement VPS (100% interactif)
-# Cible : Ubuntu / Debian (testé sur Ubuntu 24.04 LTS, sans verrou de version
+# Cible : Ubuntu / Debian (testé sur Ubuntu 24.04 et 26.04 LTS, sans verrou de version
 #         pour rester compatible avec les futures releases LTS)
 #
 # USAGE (commande unique) :
@@ -76,7 +76,7 @@ SCRIPT_VERSION="0.0.0-dev"
 # Dépôt des releases (self-update, nouvelles versions). Remplacé à la
 # publication par le dépôt qui publie (auto-release.yml) : ne l'écrire en dur
 # nulle part ailleurs dans la logique.
-INIT_VPS_REPO="studiokyne/init-vps"
+INIT_VPS_REPO="agence-lumia/init-vps"
 LOG_FILE="/var/log/init-vps.log"
 SSHD_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 STATE_DIR="/etc/init-vps"
@@ -94,6 +94,11 @@ DOKPLOY_RESTRICT_IP=""
 ADVERTISE_ADDR=""
 SERVER_ROLE=""
 DOKPLOY_PORT_CLOSED=""
+# Rôle remote : IP du manager Dokploy (persistée) et clé publique générée dans
+# Dokploy (en mémoire seulement : elle ne va QUE dans authorized_keys du compte
+# dokploy). Vide = manager pas encore configuré (vps-helper manager plus tard).
+MANAGER_IP=""
+DOKPLOY_MANAGER_KEY=""
 # Port SSH : 22 par défaut, ajustable (réduit le bruit des scans, pas une
 # mesure de sécurité en soi).
 SSH_PORT=22
@@ -196,6 +201,12 @@ backup_file() {
 }
 
 test_sshd_config() {
+    # Ubuntu 24.04, sshd activé par socket : /run/sshd n'existe que tant que
+    # ssh.service tourne (RuntimeDirectory). needrestart peut l'avoir arrêté
+    # pendant le dist-upgrade, et `sshd -t` échoue alors sur « Missing privilege
+    # separation directory » — mesuré sur une installation neuve. Sur 26.04, un
+    # tmpfiles.d le crée au boot ; le créer ici est sans effet de bord.
+    install -d -m 0755 /run/sshd
     if ! sshd -t 2>/tmp/init-vps-sshd-test.err; then
         log_err "Configuration SSH invalide, redémarrage annulé (ancienne config conservée) :"
         cat /tmp/init-vps-sshd-test.err >&2
@@ -245,6 +256,22 @@ validate_ssh_pubkey() {
     [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
 }
 
+# Clé publique générée dans Dokploy, posée derrière un from="IP" : une seule
+# ligne, sans options devant le type. `.` matche aussi le saut de ligne dans
+# une regex bash : sans le test explicite, « clé\nautre-clé » ajouterait une
+# seconde clé SANS restriction d'origine. Dupliquée dans HELPEREOF.
+validate_dokploy_pubkey() {
+    [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] && validate_ssh_pubkey "$1"
+}
+
+# IP du manager Dokploy : IPv4 seule (elle finit dans from="…", AllowUsers
+# dokploy@… et une règle UFW), adresse privée acceptée. Vide = plus tard.
+# Dupliquée dans HELPEREOF (vide refusé là-bas).
+validate_manager_ip() {
+    [[ -z "$1" ]] && return 0
+    is_valid_ipv4 "$1" && [[ "$1" != 0.* && "$1" != 127.* ]]
+}
+
 validate_timezone() {
     [[ -f "/usr/share/zoneinfo/$1" ]]
 }
@@ -267,6 +294,16 @@ validate_ip_cidr() {
         return 0
     fi
     is_valid_ipv4 "$val"
+}
+
+# Restriction d'accès au panneau Dokploy : une IP ou un CIDR d'au moins /8.
+# « 0.0.0.0/0 » (ou un /1…/7) reviendrait à ouvrir le port à tout Internet —
+# précisément ce qu'on refuse (le premier visiteur crée le compte propriétaire).
+# Même borne dans apply.sh.
+validate_dokploy_restrict_ip() {
+    [[ -z "$1" ]] && return 0
+    validate_ip_cidr "$1" || return 1
+    [[ "$1" != */* ]] || (( ${1##*/} >= 8 ))
 }
 
 validate_ip_loose() {
@@ -360,8 +397,8 @@ print_banner() {
     cat <<'EOF'
 
   ┌──────────────────────────────────────────────────┐
-  │   INIT-VPS — Initialisation & durcissement VPS    │
-  │   Ubuntu / Debian · prêt pour Dokploy             │
+  │   INIT-VPS — Initialisation & durcissement VPS   │
+  │   Ubuntu / Debian · prêt pour Dokploy            │
   └──────────────────────────────────────────────────┘
 
 EOF
@@ -470,8 +507,10 @@ collect_server_role() {
 
 collect_dokploy_restrict_ip() {
     log_step "Accès à l'interface Dokploy (port 3000)"
-    log_info "Le port 3000 sera ouvert, le temps de configurer un nom de domaine + TLS dans Dokploy (fermeture manuelle ensuite)."
-    prompt DOKPLOY_RESTRICT_IP "Restreindre cet accès à une IP/CIDR précise (vide = ouvert à tous temporairement)" "" validate_ip_cidr
+    log_info "Un Dokploy neuf laisse le PREMIER visiteur créer le compte propriétaire : le port 3000 n'est jamais ouvert à tout Internet."
+    log_info "IP/CIDR saisie : 3000 ouvert à elle seule, le temps de configurer le domaine (fermer ensuite : vps-helper close-dokploy)."
+    log_info "Vide : port fermé, accès par tunnel SSH (ssh -L 3000:127.0.0.1:3000 …), commande rappelée à la fin."
+    prompt DOKPLOY_RESTRICT_IP "IP/CIDR autorisée sur le port 3000 (vide = fermé, tunnel SSH)" "" validate_dokploy_restrict_ip
 }
 
 collect_advertise_addr() {
@@ -493,6 +532,64 @@ collect_advertise_addr() {
 
     log_info "Cette adresse sera annoncée par Docker Swarm. En cas de doute, conserver l'IP publique suggérée."
     prompt ADVERTISE_ADDR "Adresse IP à utiliser pour Docker Swarm (confirme ou corrige)" "$suggested" validate_ip_loose
+}
+
+# Rôle remote uniquement. Dokploy (≥ v0.29.0) pilote un remote avec un
+# utilisateur non-root : compte « dokploy », sudo sans mot de passe, groupe
+# docker, clé du manager restreinte à son IP (from="…").
+collect_manager() {
+    log_step "Manager Dokploy"
+    log_info "IP par laquelle le manager joindra ce serveur : son IP PRIVÉE s'ils partagent un réseau Hetzner (non filtré par le Cloud Firewall), sinon son IP publique."
+    log_info "Vide = configurer plus tard : sudo vps-helper manager --ip <IP> --key \"<clé>\""
+    prompt MANAGER_IP "IP du manager Dokploy (IPv4)" "" validate_manager_ip
+    DOKPLOY_MANAGER_KEY=""
+    [[ -z "$MANAGER_IP" ]] && return 0
+    log_info "Clé à générer dans le Dokploy du manager : Settings → SSH Keys → Create, puis copier la clé PUBLIQUE."
+    prompt DOKPLOY_MANAGER_KEY "Clé publique SSH du manager (générée dans Dokploy)" "" validate_dokploy_pubkey
+}
+
+# IPv4 privée par laquelle ce serveur est joint sur le réseau privé : la source
+# de la route vers le manager si elle est privée, sinon la première IPv4 privée
+# d'une interface réelle (hors Docker). Vide si aucune.
+detect_private_addr() {
+    local a="" ifc addr
+    if [[ -n "$MANAGER_IP" ]]; then
+        a="$(ip -4 route get "$MANAGER_IP" 2>/dev/null | grep -oP '\bsrc \K[0-9.]+' | head -n1 || true)"
+        if is_private_ipv4 "$a"; then
+            echo "$a"
+            return 0
+        fi
+    fi
+    while read -r ifc addr; do
+        case "$ifc" in lo|docker*|br-*|veth*|virbr*) continue ;; esac
+        if is_private_ipv4 "$addr"; then
+            echo "$addr"
+            return 0
+        fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print $2, a[1]}')
+    return 0
+}
+
+# Vide, ou une IPv4 réellement portée par ce serveur.
+validate_local_ipv4() {
+    [[ -z "$1" ]] && return 0
+    is_valid_ipv4 "$1" && ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$1"
+}
+
+# Rôle remote : adresse d'annonce du swarm. Dokploy l'initialiserait sinon avec
+# l'IP PUBLIQUE (« Advertise address » de son Setup Server) — mesuré : après un
+# changement d'IP publique (Primary IP déplacée), le nœud restait annoncé sur
+# une adresse qui n'existait plus sur le serveur. L'IP privée, elle, ne change pas.
+collect_remote_swarm_addr() {
+    log_step "Adresse Docker Swarm (remote)"
+    local detected
+    detected="$(detect_private_addr)"
+    if [[ -n "$detected" ]]; then
+        log_info "IP privée détectée : ${detected}. Le swarm y sera initialisé AVANT le Setup de Dokploy : une IP publique qui change ne le casse plus."
+    else
+        log_warn "Aucune IP privée détectée (serveur hors réseau privé ?). Vide = laisser Dokploy initialiser le swarm sur l'IP publique."
+    fi
+    prompt ADVERTISE_ADDR "Adresse d'annonce Docker Swarm (IP privée de ce serveur)" "$detected" validate_local_ipv4
 }
 
 collect_timezone() {
@@ -565,10 +662,17 @@ show_recap() {
         echo "  Swap                      : ${swap_line}"
         echo "  Rôle du serveur           : ${role_line}"
         if [[ "$SERVER_ROLE" == "1" ]]; then
-            [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="ouvert temporairement à tous"
+            [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="fermé (tunnel SSH)"
             [[ -n "$ADVERTISE_ADDR" ]] && advertise_line="${ADVERTISE_ADDR}" || advertise_line="auto-détection (Dokploy)"
             echo "  Accès Dokploy (port 3000) : ${dokploy_line}"
             echo "  Adresse Docker Swarm       : ${advertise_line}"
+        else
+            if [[ -n "$MANAGER_IP" ]]; then
+                echo "  Manager Dokploy           : ${MANAGER_IP} (utilisateur dokploy, clé fournie)"
+            else
+                echo "  Manager Dokploy           : à configurer plus tard (vps-helper manager)"
+            fi
+            echo "  Adresse Docker Swarm       : ${ADVERTISE_ADDR:-laissée à Dokploy (IP publique)}"
         fi
         if [[ "$NOTIFY_ENABLED" == "1" ]]; then
             echo "  Notifications             : webhook"
@@ -704,6 +808,47 @@ step_create_admin() {
     fi
 }
 
+# sudo du compte admin : une saisie vaut 30 min. `timestamp_type=global` (une
+# saisie pour tous les terminaux) n'existe pas dans sudo-rs, le sudo par défaut
+# d'Ubuntu 26.04 : `visudo -cf` le refuse (« unknown setting »). On installe
+# donc la première variante que visudo accepte, jamais un fichier non validé.
+# Temporaire dans sudoers.d même : sudo ignore les noms contenant un point.
+step_admin_sudo() {
+    log_step "sudo du compte admin (délai de ré-authentification)"
+    local target=/etc/sudoers.d/10-admin-timestamp content tmp
+    local -a variants=(
+        "Defaults:${ADMIN_USER} timestamp_timeout=30, timestamp_type=global"
+        "Defaults:${ADMIN_USER} timestamp_timeout=30"
+    )
+    if ! command -v visudo &>/dev/null; then
+        log_warn "visudo introuvable : délai sudo laissé par défaut."
+        return
+    fi
+    for content in "${variants[@]}"; do
+        tmp="$(mktemp /etc/sudoers.d/.10-admin-timestamp.XXXXXX)"
+        printf '# Généré par init-vps.sh.\n%s\n' "$content" > "$tmp"
+        chmod 0440 "$tmp"
+        if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+            rm -f "$tmp"
+            continue
+        fi
+        if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
+            rm -f "$tmp"
+            log_info "Déjà configuré : ${content}"
+            return
+        fi
+        backup_file "$target"
+        mv -f "$tmp" "$target"
+        if [[ "$content" == *timestamp_type* ]]; then
+            log_ok "sudo : une saisie valable 30 min, dans tous les terminaux."
+        else
+            log_ok "sudo : une saisie valable 30 min, par terminal (sudo-rs ne gère pas timestamp_type)."
+        fi
+        return
+    done
+    log_warn "Aucune variante acceptée par visudo : délai sudo laissé par défaut (aucun fichier installé)."
+}
+
 ###############################################################################
 # 4. FAIL2BAN — configuré et démarré AVANT l'ouverture SSH
 ###############################################################################
@@ -830,16 +975,43 @@ ssh_close_old_ports() {
     done
 }
 
-# Écrit la configuration SSH verrouillée, écoutant sur les ports passés en
-# arguments. Partagée par la phase 2 et la migration de port.
-write_sshd_final_config() {
-    cat > "$SSHD_HARDENING_FILE" <<EOF
+# Échanges de clés, post-quantiques en tête, filtrés sur ce que l'OpenSSH
+# installé connaît : une liste fixe serait refusée par `sshd -t` d'un côté ou
+# de l'autre (mlkem768x25519-sha256 : OpenSSH ≥ 9.9, donc 26.04 mais pas
+# 24.04). Sans eux, tout client OpenSSH ≥ 10 affiche « connection is not using
+# a post-quantum key exchange algorithm » (https://openssh.com/pq.html).
+ssh_kex_algorithms() {
+    local -a wanted=(mlkem768x25519-sha256 sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com
+                     curve25519-sha256 curve25519-sha256@libssh.org diffie-hellman-group16-sha512)
+    local supported kex out=""
+    supported="$(ssh -Q kex 2>/dev/null || true)"
+    for kex in "${wanted[@]}"; do
+        grep -qxF "$kex" <<< "$supported" && out="${out:+${out},}${kex}"
+    done
+    echo "${out:-curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512}"
+}
+
+# AllowUsers : le compte admin, plus — rôle remote avec manager configuré —
+# le compte dokploy restreint à l'IP du manager (motif user@hôte de sshd).
+sshd_allow_users() {
+    local users="$ADMIN_USER"
+    if [[ "$SERVER_ROLE" == "2" && -n "$MANAGER_IP" ]]; then
+        users="${users} dokploy@${MANAGER_IP}"
+    fi
+    echo "$users"
+}
+
+# Contenu de la configuration SSH verrouillée, écoutant sur les ports passés en
+# arguments. Seule source de ce contenu : phase 2, migration de port et
+# rafraîchissement d'un serveur déjà verrouillé passent tous par ici.
+sshd_final_config_content() {
+    cat <<EOF
 $(ssh_port_directives "$@")
 PubkeyAuthentication yes
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-AllowUsers ${ADMIN_USER}
+AllowUsers $(sshd_allow_users)
 MaxAuthTries 3
 LoginGraceTime 20
 X11Forwarding no
@@ -848,10 +1020,41 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 
 # Algorithmes modernes uniquement
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+KexAlgorithms $(ssh_kex_algorithms)
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 EOF
+}
+
+write_sshd_final_config() {
+    sshd_final_config_content "$@" > "$SSHD_HARDENING_FILE"
+}
+
+# Serveur déjà verrouillé, port inchangé : réécrit la configuration si son
+# contenu a changé (nouvelle version du script, manager Dokploy ajouté…).
+# Sans cela, un --update ne propageait rien : la phase 2 ne faisait que la
+# migration de port. Une configuration refusée par `sshd -t` est remplacée par
+# l'ancienne, sans quitter le script : sshd n'a pas été touché.
+ssh_refresh_final_config() {
+    local want prev
+    want="$(sshd_final_config_content "$SSH_PORT")"
+    prev="$(cat "$SSHD_HARDENING_FILE" 2>/dev/null || true)"
+    if [[ "$want" == "$prev" ]]; then
+        log_info "SSH déjà verrouillé, configuration à jour."
+        return 0
+    fi
+    backup_file "$SSHD_HARDENING_FILE"
+    printf '%s\n' "$want" > "$SSHD_HARDENING_FILE"
+    install -d -m 0755 /run/sshd
+    if ! sshd -t 2>/tmp/init-vps-sshd-test.err; then
+        printf '%s\n' "$prev" > "$SSHD_HARDENING_FILE"
+        log_err "Nouvelle configuration SSH refusée par sshd -t, ancienne configuration remise :"
+        cat /tmp/init-vps-sshd-test.err >&2
+        cat /tmp/init-vps-sshd-test.err >> "$LOG_FILE" 2>/dev/null || true
+        return 0
+    fi
+    ssh_restart "$SSH_PORT" || log_warn "Vérifier l'écoute de sshd AVANT de fermer cette session : ss -ltnp | grep sshd"
+    log_ok "Configuration SSH verrouillée mise à jour (AllowUsers : $(sshd_allow_users))."
 }
 
 # Changement de port sur un serveur DÉJÀ verrouillé (mode mise à jour). Même
@@ -866,7 +1069,7 @@ ssh_port_migration() {
         [[ "$p" == "$SSH_PORT" ]] || old+=("$p")
     done
     if [[ "${#old[@]}" -eq 0 ]]; then
-        log_info "SSH déjà verrouillé, rien à faire."
+        ssh_refresh_final_config
         return
     fi
 
@@ -954,6 +1157,29 @@ EOF
 ###############################################################################
 # 6. UFW — RÈGLES DE BASE
 ###############################################################################
+# Accès au panneau Dokploy (3000/tcp) : une IP/CIDR, ou vide (fermé, rôle
+# remote, ou aucune restriction saisie). JAMAIS tout Internet : un Dokploy neuf
+# laisse le premier visiteur créer le compte propriétaire. Sans IP, l'accès se
+# fait par tunnel SSH. Seule source de cette décision, pour UFW
+# (step_ufw_base) comme pour DOCKER-USER (step_docker_user_firewall) : c'est
+# DOCKER-USER qui filtre réellement un port publié par Docker. Une valeur de
+# config.env trop large (« 0.0.0.0/0 ») est ignorée, comme à la saisie.
+dokploy_ui_source() {
+    [[ "$SERVER_ROLE" == "1" && "$DOKPLOY_PORT_CLOSED" != "1" && -n "$DOKPLOY_RESTRICT_IP" ]] || return 0
+    validate_dokploy_restrict_ip "$DOKPLOY_RESTRICT_IP" || return 0
+    echo "$DOKPLOY_RESTRICT_IP"
+}
+
+# Commande de tunnel vers le panneau Dokploy (port 3000 fermé).
+dokploy_tunnel_hint() {
+    local host="${SERVER_IP:-<IP_DU_SERVEUR>}"
+    if [[ "$SSH_PORT" == "22" ]]; then
+        echo "ssh -L 3000:127.0.0.1:3000 ${ADMIN_USER}@${host}, puis http://127.0.0.1:3000"
+    else
+        echo "ssh -p ${SSH_PORT} -L 3000:127.0.0.1:3000 ${ADMIN_USER}@${host}, puis http://127.0.0.1:3000"
+    fi
+}
+
 step_ufw_base() {
     log_step "Configuration du pare-feu (UFW)"
     ufw default deny incoming >/dev/null
@@ -989,15 +1215,18 @@ step_ufw_base() {
     # close-dokploy`, qui persiste ce choix dans $STATE_FILE) : sans ces deux
     # gardes, un rôle remote se retrouvait avec 3000/tcp ouvert pour rien, et
     # une relance en mode mise à jour rouvrait un port fermé exprès.
+    local ui_src
+    ui_src="$(dokploy_ui_source)"
     if [[ "$SERVER_ROLE" != "1" ]]; then
         log_info "Rôle 'remote server' : port 3000 (Dokploy) non ouvert, non applicable."
     elif [[ "$DOKPLOY_PORT_CLOSED" == "1" ]]; then
         log_info "Port 3000 laissé fermé (fermé précédemment via « vps-helper close-dokploy »)."
-    elif [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
-        ufw allow from "$DOKPLOY_RESTRICT_IP" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
+    elif [[ -z "$ui_src" ]]; then
+        log_info "Port 3000 fermé : un Dokploy neuf laisse le premier visiteur créer le compte propriétaire. Accès par tunnel SSH : $(dokploy_tunnel_hint)"
     else
-        ufw allow 3000/tcp comment 'Dokploy UI - a fermer manuellement apres config domaine' >/dev/null
-        log_warn "Port 3000 ouvert à tous. Fermeture requise une fois le domaine et le TLS configurés dans Dokploy (sudo vps-helper close-dokploy)."
+        ufw allow from "$ui_src" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
+        log_warn "Port 3000 ouvert à ${ui_src} seulement, le temps de configurer le domaine (fermer ensuite : sudo vps-helper close-dokploy)."
+        log_warn "Pare-feu externe (Hetzner Cloud Firewall…) : y autoriser aussi 3000/tcp depuis ${ui_src}, puis l'en retirer après close-dokploy. Il est invisible d'ici."
     fi
 
     ufw --force enable >/dev/null
@@ -1383,10 +1612,23 @@ step_motd() {
 
     # Désactive les scripts MOTD par défaut d'Ubuntu (news, pubs ESM, alertes
     # de fin de support...) pour ne garder qu'un affichage propre et uniforme.
+    # motd-news d'abord, les chmod ensuite : si motd-news.timer se déclenchait
+    # entre les deux, son service exécutait un 50-motd-news déjà non exécutable
+    # et restait en échec (203/EXEC) — mesuré sur une installation neuve 26.04,
+    # remonté en FAIL par `check`. mask plutôt que disable : une mise à jour du
+    # paquet ne le réactive pas. ENABLED=0 est le réglage prévu par Ubuntu.
+    # Arrêt AVANT le masquage : un timer masqué encore actif échoue au
+    # daemon-reload suivant (« Unit to trigger vanished », Result: resources),
+    # mesuré sur une installation neuve 26.04.
+    systemctl stop motd-news.timer motd-news.service >/dev/null 2>&1 || true
+    systemctl mask motd-news.timer >/dev/null 2>&1 || true
+    if [[ -f /etc/default/motd-news ]]; then
+        sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+    fi
+    systemctl reset-failed motd-news.timer motd-news.service >/dev/null 2>&1 || true
     if [[ -d /etc/update-motd.d ]]; then
         chmod -x /etc/update-motd.d/* 2>/dev/null || true
     fi
-    systemctl disable --now motd-news.timer >/dev/null 2>&1 || true
     : > /etc/motd 2>/dev/null || true
 
     # /etc/legal (notice « free software / NO WARRANTY ») est affiché à chaque
@@ -1409,11 +1651,11 @@ step_motd() {
     fi
 
     mkdir -p /etc/update-motd.d
-    backup_file /etc/update-motd.d/00-studiokyne
+    backup_file /etc/update-motd.d/00-lumia
     # Écrit à côté puis renommé (voir CLAUDE.md, « Écriture des fichiers
     # générés ») ; run-parts ignore les noms commençant par un point.
     local motd_tmp
-    motd_tmp="$(mktemp /etc/update-motd.d/.00-studiokyne.XXXXXX)"
+    motd_tmp="$(mktemp /etc/update-motd.d/.00-lumia.XXXXXX)"
     cat > "$motd_tmp" <<'MOTDEOF'
 #!/usr/bin/env bash
 # MOTD — généré par init-vps.sh, design uniforme à chaque connexion.
@@ -1472,7 +1714,9 @@ fi
 
 printf '\n'
 printf "${C_CYAN}  ┌──────────────────────────────────────────────────┐${C_RESET}\n"
-printf "${C_CYAN}  │${C_RESET} ${C_BOLD}%-51s${C_RESET}${C_CYAN}│${C_RESET}\n" "${HOSTNAME_VAL}"
+# Cadre de 50 colonnes intérieures : « │ » + espace + 49 + « │ ». %-51s débordait
+# de 2 colonnes ; .49 tronque un hostname plus long (RFC 1123 : jusqu'à 63).
+printf "${C_CYAN}  │${C_RESET} ${C_BOLD}%-49.49s${C_RESET}${C_CYAN}│${C_RESET}\n" "${HOSTNAME_VAL}"
 printf "${C_CYAN}  └──────────────────────────────────────────────────┘${C_RESET}\n"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Système"   "${OS_PRETTY} (${KERNEL})"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Uptime"    "${UPTIME_VAL}"
@@ -1492,7 +1736,16 @@ printf "\n  ${C_DIM}Administration du serveur :${C_RESET} ${C_BOLD}vps-helper${C
 printf '\n'
 MOTDEOF
     chmod 755 "$motd_tmp"
-    mv -f "$motd_tmp" /etc/update-motd.d/00-studiokyne
+    mv -f "$motd_tmp" /etc/update-motd.d/00-lumia
+
+    # Migration : ce script s'appelait 00-studiokyne. Le laisser afficherait le
+    # MOTD deux fois (run-parts exécute les deux). Retiré APRÈS l'installation
+    # du nouveau : aucune connexion ne se fait sans MOTD. Sauvegardé comme le reste.
+    if [[ -f /etc/update-motd.d/00-studiokyne ]]; then
+        backup_file /etc/update-motd.d/00-studiokyne
+        rm -f /etc/update-motd.d/00-studiokyne
+        log_info "Ancien /etc/update-motd.d/00-studiokyne retiré (remplacé par 00-lumia)."
+    fi
 
     # Sur Ubuntu 24.04, pam_motd.so est configuré avec noupdate par défaut :
     # les scripts update-motd.d ne sont exécutés qu'au boot, pas à chaque login.
@@ -1629,7 +1882,7 @@ iv_update_available() {
     iv_version_gt "$latest" "$INIT_VPS_VERSION"
 }
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall notify-test notify-set reboot-auto reboot-skip reboot-status self-update"
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall notify-test notify-set reboot-auto reboot-skip reboot-status self-update manager"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -1647,6 +1900,9 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper whitelist <IP>${C_RESET}      Ajouter une IP de confiance (jamais bannie par fail2ban)
   ${C_CYAN}vps-helper unban <IP>${C_RESET}          Débannir une IP bannie par fail2ban
   ${C_CYAN}vps-helper close-dokploy${C_RESET}       Fermer l'accès direct au port 3000 (Dokploy)
+  ${C_CYAN}vps-helper manager [--ip IP] [--key "clé"]${C_RESET}
+                                 Remote : accès du manager Dokploy (compte dokploy,
+                                 clé restreinte à son IP) · sans argument : état
   ${C_CYAN}vps-helper ssh-keys list [user]${C_RESET}    Lister les clés SSH d'un utilisateur (défaut : compte admin)
   ${C_CYAN}vps-helper ssh-keys add [user]${C_RESET}     Ajouter une clé SSH (invite à la coller)
   ${C_CYAN}vps-helper ssh-keys remove [user]${C_RESET}  Supprimer une clé SSH (choix dans une liste numérotée)
@@ -1675,10 +1931,10 @@ EOF
 }
 
 cmd_status() {
-    if [[ -x /etc/update-motd.d/00-studiokyne ]]; then
-        /etc/update-motd.d/00-studiokyne
+    if [[ -x /etc/update-motd.d/00-lumia ]]; then
+        /etc/update-motd.d/00-lumia
     else
-        err "Script de statut introuvable (/etc/update-motd.d/00-studiokyne)."
+        err "Script de statut introuvable (/etc/update-motd.d/00-lumia)."
         exit 1
     fi
 }
@@ -1866,8 +2122,20 @@ cmd_close_dokploy() {
         found=1
         attempts=$((attempts+1))
     done
+    # C'est DOCKER-USER qui filtre réellement le port publié par Dokploy : UFW
+    # ne voit pas ce trafic. On retire son autorisation puis on réapplique —
+    # seulement si la chaîne porte nos règles (jamais d'écrasement de tiers).
+    if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+        rm -f "$DOCKER_USER_DOKPLOY_FILE"
+        found=1
+        if [ -x "$DOCKER_USER_APPLY" ] && docker_user_rules | grep -q -- '--comment init-vps'; then
+            "$DOCKER_USER_APPLY" || warn "Réapplication des règles DOCKER-USER en échec : vps-helper docker-firewall status"
+        fi
+    fi
     if [[ "$found" -eq 1 ]]; then
-        ok "Port 3000 fermé. Désactivation de l'accès direct via IP:port recommandée dans les réglages Dokploy."
+        ok "Port 3000 fermé (UFW et DOCKER-USER). Désactivation de l'accès direct via IP:port recommandée dans les réglages Dokploy."
+        info "Pare-feu Hetzner (Cloud Firewall) : y retirer aussi 3000/tcp s'il y avait été autorisé."
+        info "Accès de secours au panneau : ssh -L 3000:127.0.0.1:3000 <admin>@<serveur>, puis http://127.0.0.1:3000"
     else
         info "Aucune règle ouverte sur le port 3000, rien à fermer."
     fi
@@ -2242,6 +2510,8 @@ FRAGEOF
 # FORWARD (DOCKER-USER, DOCKER-FORWARD) sans passer par les chaînes ufw-*.
 # Ces trois fonctions servent à la fois à `check` et à `docker-firewall`.
 DOCKER_USER_APPLY=/usr/local/lib/docker-user/apply.sh
+# Présent = accès au panneau Dokploy (3000/tcp) laissé passer par apply.sh.
+DOCKER_USER_DOKPLOY_FILE=/usr/local/lib/docker-user/dokploy-ui
 
 # Un « port/proto » par ligne, dédoublonné. `done < <(...)` et non un pipe :
 # la boucle doit tourner dans le shell courant.
@@ -2332,6 +2602,15 @@ cmd_docker_firewall() {
                 case "$published" in
                     80/tcp|443/tcp|443/udp)
                         info "  ${published} (autorisé)" ;;
+                    3000/tcp)
+                        if [ "$filtered" -eq 1 ] && [ -f "$DOCKER_USER_DOKPLOY_FILE" ]; then
+                            warn "  ${published} (panneau Dokploy autorisé depuis $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") — fermer : vps-helper close-dokploy)"
+                        elif [ "$filtered" -eq 1 ]; then
+                            info "  ${published} (bloqué depuis Internet par DOCKER-USER)"
+                        else
+                            warn "  ${published} (exposé à Internet : aucune règle DOCKER-USER)"
+                        fi
+                        ;;
                     *)
                         if [ "$filtered" -eq 1 ]; then
                             warn "  ${published} (bloqué depuis Internet par DOCKER-USER)"
@@ -2397,9 +2676,14 @@ MEM_EVENTS_MIN_AGE=86400
 MEM_RECLAIM_MIN_PAGES=16
 # Garde-fou thrashing : code mappé évincé puis relu depuis le disque sans OOM —
 # pgsteal non nul mais pgmajfault élevé. FAIL si pgmajfault > ce plancher ET
-# pgmajfault × 10 > max. Seuil PROVISOIRE : ce cas n'a jamais été mesuré avec
-# ces compteurs (méthode de test dans CLAUDE.md).
-MEM_MAJFAULT_FLOOR=100
+# pgmajfault × 10 > max.
+# Plancher relevé de 100 à 1000 (29/09/2026, 3 j après un reboot, 15 conteneurs) :
+#   - bruit de fond : 19 à 311 majfaults (chargement du binaire et des libs à
+#     froid au démarrage, pas des dépassements) — nginx Coyac à 135 pour 328
+#     reclaims de cache bénins (448 pages libérées chacun) tombait en FAIL ;
+#   - vrais cas : wordpress (PHP-FPM) à 39 032 et 94 385 majfaults, limite 1G
+#     saturée (memory.peak = memory.max).
+MEM_MAJFAULT_FLOOR=1000
 
 human_bytes() { numfmt --to=iec --suffix=o "$1" 2>/dev/null || echo "${1} o"; }
 
@@ -2459,8 +2743,12 @@ check_container_memory() {
     if [ -z "$klog" ]; then
         chk_warn "Journal noyau illisible : OOM kills non vérifiables"
     else
-        oom_lines="$(grep -E 'Out of memory|oom-kill:' <<< "$klog" || true)"
-        cg_n=$(grep -c 'Memory cgroup out of memory' <<< "$oom_lines" || true)
+        # Casse : le noyau écrit « Out of memory: Killed process » (OOM global) mais
+        # « Memory cgroup out of memory: Killed process » (OOM de cgroup, o minuscule,
+        # mm/oom_kill.c). Filtrer sur « Out of memory » seul perdait tous les OOM de
+        # cgroup : cg_n restait à 0 et le contrôle affichait un faux PASS.
+        oom_lines="$(grep -E '[Oo]ut of memory|oom-kill:' <<< "$klog" || true)"
+        cg_n=$(grep -c 'Memory cgroup out of memory: Kill' <<< "$oom_lines" || true)
         global_n=$(grep 'Out of memory: Kill' <<< "$oom_lines" | grep -vc 'Memory cgroup' || true)
         while read -r count id; do
             [ -z "$id" ] && continue
@@ -2490,7 +2778,7 @@ check_container_memory() {
         return
     fi
     local now full pid started dir max_ev oom_ev limit peak age start_s ratio
-    local steal majf benign
+    local steal majf benign swp
     local -a cheap=()
     local ok_n=0 unlimited_n=0 unreadable_n=0
     now=$(date +%s)
@@ -2529,7 +2817,10 @@ check_container_memory() {
                 continue
             fi
             if [ "$majf" -gt "$MEM_MAJFAULT_FLOOR" ] && [ $((majf * 10)) -gt "$max_ev" ]; then
-                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} relectures disque de code en $(human_age "$age") — limite $(human_bytes "$limit")"
+                # pgmajfault compte aussi les retours depuis le swap : Docker accorde
+                # par défaut autant de swap que la limite mémoire (memory.swap.max).
+                swp=$(cat "${dir}/memory.swap.current" 2>/dev/null || echo 0)
+                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} défauts de page majeurs (code relu ou swap) en $(human_age "$age") — limite $(human_bytes "$limit"), swap $(human_bytes "${swp:-0}")"
                 fail=$((fail+1))
                 continue
             fi
@@ -2987,7 +3278,13 @@ reboot_notice() {
 reboot_postpone() {
     local reason="$1" when id
     read -r when id < "$REBOOT_PLANNED"
-    when=$(date -d "$(date -d "@$when" '+%F %H:%M') +1 day" +%s)
+    # Jour suivant PUIS heure, jamais « AAAA-MM-JJ HH:MM +1 day » : GNU date lit
+    # ce « +1 » comme un décalage de fuseau (UTC+1). Mesuré sur 24.04 : report à
+    # 05:00 au lieu de 04:00 en été à Paris, 03:00 sur un serveur en UTC.
+    local day hm
+    day="$(date -d "@$when" +%F)"
+    hm="$(date -d "@$when" +%H:%M)"
+    when=$(date -d "$(date -d "$day +1 day" +%F) ${hm}" +%s)
     echo "$when ${id}" > "$REBOOT_PLANNED"
     if [ -n "$id" ]; then
         vps-notify --level info --edit "$id" "Redémarrage reporté" \
@@ -3099,7 +3396,382 @@ cmd_reboot_status() {
     if [ -f "$REBOOT_PLANNED" ]; then
         local when
         read -r when _ < "$REBOOT_PLANNED"
-        info "Planifié le $(fmt_when "$when") (± 30 min) — reporter : vps-helper reboot-skip"
+        # Serveur redémarré entre-temps (à la main, ou éteint/rallumé) : plus
+        # rien n'est requis, reboot_run effacera la planification sans redémarrer.
+        if [ -f /var/run/reboot-required ]; then
+            info "Planifié le $(fmt_when "$when") (± 30 min) — reporter : vps-helper reboot-skip"
+        else
+            info "Planification du $(fmt_when "$when") caduque (plus rien de requis) : effacée à la fenêtre, sans redémarrage."
+        fi
+    fi
+}
+
+# --- Rôle remote : accès du manager Dokploy (issue #1) ----------------------
+# Dokploy ≥ v0.29.0 (PR #4059) pilote un remote avec un utilisateur non-root, à
+# deux conditions vérifiées par son « Validate » (server-validate.ts) :
+# `sudo -n true` réussit, et l'utilisateur est dans le groupe docker. Son script
+# de mise en place teste $EUID : le shell doit être bash.
+# `vps-helper manager` est la SEULE implémentation : step_dokploy_remote
+# (init-vps.sh) l'appelle. Chaque étape est idempotente et retire l'ancienne IP.
+DOKPLOY_USER=dokploy
+DOKPLOY_SUDOERS=/etc/sudoers.d/90-dokploy
+SSHD_HARDENING=/etc/ssh/sshd_config.d/99-hardening.conf
+UFW_MANAGER_COMMENT="SSH Dokploy manager"
+
+# Dupliquée depuis init-vps.sh (validate_dokploy_pubkey) : une seule ligne.
+validate_dokploy_pubkey() {
+    [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] && validate_ssh_pubkey "$1"
+}
+
+# IPv4 seule, ni 0.x ni 127.x (elle finit dans from="…", AllowUsers et UFW).
+manager_ip_valid() {
+    local o
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do
+        [ $((10#$o)) -le 255 ] || return 1
+    done
+    [[ "$1" != 0.* && "$1" != 127.* ]]
+}
+
+# Même emplacement que backup_file (init-vps.sh) : un .bak dans sudoers.d ou
+# sshd_config.d serait relu comme configuration.
+iv_backup() {
+    [ -f "$1" ] || return 0
+    local dest
+    dest="/var/backups/init-vps${1}.bak-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$(dirname "$dest")" && cp -a "$1" "$dest"
+}
+
+manager_ssh_port() {
+    local p
+    p="$(state_get SSH_PORT)"
+    [[ "$p" =~ ^[0-9]+$ ]] || p="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+    echo "${p:-22}"
+}
+
+# Compte système, shell bash, groupe docker. Mot de passe « * » : inutilisable,
+# mais pas « verrouillé » au sens de sshd (un « ! » refuse aussi la clé si
+# UsePAM passe un jour à no).
+dokploy_account_apply() {
+    if ! getent group docker >/dev/null 2>&1; then
+        err "Groupe docker absent : installer Docker d'abord (init-vps.sh le fait en rôle remote)."
+        return 1
+    fi
+    if ! id "$DOKPLOY_USER" >/dev/null 2>&1; then
+        useradd --system --create-home --home-dir "/home/${DOKPLOY_USER}" --shell /bin/bash "$DOKPLOY_USER" || return 1
+        ok "Compte ${DOKPLOY_USER} créé."
+    fi
+    [ "$(getent passwd "$DOKPLOY_USER" | cut -d: -f7)" = /bin/bash ] || usermod -s /bin/bash "$DOKPLOY_USER"
+    case "$(getent shadow "$DOKPLOY_USER" | cut -d: -f2)" in
+        '!'*|'') usermod -p '*' "$DOKPLOY_USER" ;;
+    esac
+    id -nG "$DOKPLOY_USER" | grep -qw docker || usermod -aG docker "$DOKPLOY_USER"
+}
+
+# Écrit dans un temporaire du même répertoire (sudo ignore les noms contenant
+# un point), validé par visudo -cf, installé en 0440 : aucun fichier installé
+# si la validation échoue. NOPASSWD est accepté par sudo et par sudo-rs.
+dokploy_sudoers_apply() {
+    local tmp
+    tmp="$(mktemp /etc/sudoers.d/.90-dokploy.XXXXXX)" || return 1
+    printf '# Généré par init-vps (vps-helper manager) : Dokploy exige sudo sans mot de passe.\n%s ALL=(ALL) NOPASSWD:ALL\n' "$DOKPLOY_USER" > "$tmp"
+    chmod 0440 "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        err "sudoers refusé par visudo -cf : ${DOKPLOY_SUDOERS} non installé."
+        return 1
+    fi
+    if [ -f "$DOKPLOY_SUDOERS" ] && cmp -s "$tmp" "$DOKPLOY_SUDOERS"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    iv_backup "$DOKPLOY_SUDOERS"
+    mv -f "$tmp" "$DOKPLOY_SUDOERS"
+    ok "sudo sans mot de passe pour ${DOKPLOY_USER} (${DOKPLOY_SUDOERS})."
+}
+
+# authorized_keys : UNIQUEMENT la clé du manager, derrière from="IP". Sans
+# nouvelle clé, celle(s) en place sont gardées et leur from= réaligné.
+dokploy_keys_apply() {
+    local ip="$1" key="$2" home ak want line bare
+    home="$(getent passwd "$DOKPLOY_USER" | cut -d: -f6)"
+    ak="${home}/.ssh/authorized_keys"
+    install -d -m 700 -o "$DOKPLOY_USER" -g "$DOKPLOY_USER" "${home}/.ssh"
+    if [ -n "$key" ]; then
+        want="from=\"${ip}\" ${key}"
+    else
+        want=""
+        while IFS= read -r line; do
+            bare="$(sed -E 's/^from="[^"]*"[[:space:]]+//' <<< "$line")"
+            validate_dokploy_pubkey "$bare" && want="${want}${want:+$'\n'}from=\"${ip}\" ${bare}"
+        done < <(grep -v '^[[:space:]]*\(#\|$\)' "$ak" 2>/dev/null || true)
+        if [ -z "$want" ]; then
+            err "Aucune clé du manager en place : --key \"<clé publique générée dans Dokploy>\" requis."
+            return 1
+        fi
+    fi
+    if [ "$want" = "$(cat "$ak" 2>/dev/null)" ]; then
+        return 0
+    fi
+    iv_backup "$ak"
+    printf '%s\n' "$want" > "${ak}.tmp"
+    chmod 600 "${ak}.tmp"
+    chown "${DOKPLOY_USER}:${DOKPLOY_USER}" "${ak}.tmp"
+    mv -f "${ak}.tmp" "$ak"
+    ok "Clé du manager posée pour ${DOKPLOY_USER}, restreinte à ${ip}."
+}
+
+# AllowUsers : remplace tout jeton dokploy / dokploy@… par dokploy@IP. Même
+# résultat que sshd_allow_users (init-vps.sh), qui reste la source du fichier
+# complet. sshd -t avant rechargement ; en cas de refus, ancien fichier remis.
+dokploy_sshd_apply() {
+    local ip="$1" line tok want prev
+    local -a users=() toks=()
+    if ! grep -q '^AllowUsers ' "$SSHD_HARDENING" 2>/dev/null; then
+        warn "${SSHD_HARDENING} sans AllowUsers (SSH pas encore verrouillé) : rien à faire."
+        return 0
+    fi
+    line="$(grep -m1 '^AllowUsers ' "$SSHD_HARDENING")"
+    # read -a et non une boucle sur ${line…} : un motif sshd « *@10.0.0.* »
+    # serait développé comme un glob.
+    read -ra toks <<< "${line#AllowUsers }"
+    for tok in "${toks[@]}"; do
+        [ "$tok" = "$DOKPLOY_USER" ] || [[ "$tok" == "${DOKPLOY_USER}@"* ]] || users+=("$tok")
+    done
+    users+=("${DOKPLOY_USER}@${ip}")
+    want="AllowUsers ${users[*]}"
+    [ "$want" = "$line" ] && return 0
+    prev="$(cat "$SSHD_HARDENING")"
+    iv_backup "$SSHD_HARDENING"
+    sed -i "s/^AllowUsers .*/${want}/" "$SSHD_HARDENING"
+    install -d -m 0755 /run/sshd
+    if ! sshd -t 2>/dev/null; then
+        printf '%s\n' "$prev" > "$SSHD_HARDENING"
+        err "Configuration SSH refusée par sshd -t : ancienne configuration remise."
+        return 1
+    fi
+    systemctl try-reload-or-restart ssh.service >/dev/null 2>&1 || true
+    ok "SSH : ${want}"
+}
+
+# Règle UFW du manager sur le port SSH, AVANT la règle « limit » : sinon la
+# limite de débit (6 connexions / 30 s) coupe les déploiements, qui ouvrent
+# de nombreuses connexions SSH. Toute autre règle portant notre commentaire
+# (ancienne IP, ancien port) est retirée.
+ufw_numbered() {
+    ufw status numbered 2>/dev/null | sed -nE 's/^\[ *([0-9]+)\] /\1 /p'
+}
+
+dokploy_ufw_apply() {
+    local ip="$1" port="$2" n ours lim attempts=0
+    command -v ufw >/dev/null 2>&1 || return 0
+    while [ "$attempts" -lt 20 ]; do
+        n="$(ufw_numbered | awk -v ip="$ip" -v p="${port}/tcp" -v c="# ${UFW_MANAGER_COMMENT}" \
+            'index($0, c) && !($2 == p && $3 == "ALLOW" && $5 == ip) {print $1; exit}')"
+        [ -z "$n" ] && break
+        yes | ufw delete "$n" >/dev/null 2>&1 || break
+        attempts=$((attempts+1))
+    done
+    ours="$(ufw_numbered | awk -v ip="$ip" -v p="${port}/tcp" -v c="# ${UFW_MANAGER_COMMENT}" \
+        'index($0, c) && $2 == p && $3 == "ALLOW" && $5 == ip {print $1; exit}')"
+    lim="$(ufw_numbered | awk -v p="${port}/tcp" '$2 == p && $3 == "LIMIT" {print $1; exit}')"
+    if [ -n "$ours" ] && { [ -z "$lim" ] || [ "$ours" -lt "$lim" ]; }; then
+        return 0
+    fi
+    if [ -n "$ours" ]; then
+        yes | ufw delete "$ours" >/dev/null 2>&1 || true
+        lim="$(ufw_numbered | awk -v p="${port}/tcp" '$2 == p && $3 == "LIMIT" {print $1; exit}')"
+    fi
+    if [ -n "$lim" ]; then
+        ufw insert "$lim" allow from "$ip" to any port "$port" proto tcp comment "$UFW_MANAGER_COMMENT" >/dev/null || return 1
+    else
+        ufw allow from "$ip" to any port "$port" proto tcp comment "$UFW_MANAGER_COMMENT" >/dev/null || return 1
+    fi
+    ok "UFW : SSH (${port}/tcp) autorisé depuis ${ip}, avant la limite de débit."
+}
+
+# ignoreip : ajoute l'IP du manager, retire l'ancienne, garde le reste.
+dokploy_fail2ban_apply() {
+    local ip="$1" old="$2" jail=/etc/fail2ban/jail.local line want
+    [ -f "$jail" ] || return 0
+    line="$(grep -m1 '^ignoreip' "$jail" || true)"
+    if [ -z "$line" ]; then
+        want="ignoreip = 127.0.0.1/8 ::1 ${ip}"
+    else
+        want="$(awk -v ip="$ip" -v old="$old" '{
+            out = $1 " " $2
+            for (i = 3; i <= NF; i++) if ($i != ip && ($i != old || old == ip)) out = out " " $i
+            print out " " ip }' <<< "$line")"
+    fi
+    [ "$want" = "$line" ] && return 0
+    iv_backup "$jail"
+    if [ -z "$line" ]; then
+        sed -i "/^\[DEFAULT\]/a ${want}" "$jail"
+    else
+        sed -i "s|^ignoreip.*|${want}|" "$jail"
+    fi
+    systemctl restart fail2ban >/dev/null 2>&1 || warn "Redémarrage de fail2ban en échec : systemctl status fail2ban"
+    if [ -n "$old" ] && [ "$old" != "$ip" ]; then
+        ok "fail2ban : ${ip} jamais bannie (${old} retirée de la liste blanche)."
+    else
+        ok "fail2ban : ${ip} jamais bannie."
+    fi
+}
+
+manager_status() {
+    local ip home ak
+    ip="$(state_get MANAGER_IP)"
+    printf '\n%b\n' "${C_BOLD}Accès du manager Dokploy${C_RESET}"
+    if [ -z "$ip" ]; then
+        info "Aucun manager configuré. sudo vps-helper manager --ip <IP> --key \"<clé>\""
+        return 0
+    fi
+    info "IP du manager : ${ip}"
+    if id "$DOKPLOY_USER" >/dev/null 2>&1; then
+        info "Compte ${DOKPLOY_USER} : $(id -nG "$DOKPLOY_USER")"
+        home="$(getent passwd "$DOKPLOY_USER" | cut -d: -f6)"
+        ak="${home}/.ssh/authorized_keys"
+        [ -f "$ak" ] && ssh-keygen -lf "$ak" 2>/dev/null | sed 's/^/    /'
+    else
+        warn "Compte ${DOKPLOY_USER} absent."
+    fi
+    info "$(grep -m1 '^AllowUsers ' "$SSHD_HARDENING" 2>/dev/null || echo 'AllowUsers : non verrouillé')"
+    info "Dans Dokploy : Settings → Servers → Add Server — utilisateur ${DOKPLOY_USER}, port $(manager_ssh_port), IP $(ip -4 route get "$ip" 2>/dev/null | grep -oP '\bsrc \K[0-9.]+' | head -n1)"
+}
+
+cmd_manager() {
+    local ip="" key="" old port
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ip)  ip="${2:-}"; shift 2 || shift ;;
+            --key) key="${2:-}"; shift 2 || shift ;;
+            -h|--help)
+                echo "Usage : vps-helper manager [--ip <IPv4>] [--key \"<clé publique générée dans Dokploy>\"]"
+                echo "        sans argument : état actuel"
+                return 0 ;;
+            *) err "Argument inconnu : « $1 »."; return 2 ;;
+        esac
+    done
+    # config.env absent = appel depuis la première installation (step_dokploy_remote).
+    if [ -f "$INIT_VPS_STATE" ] && [ "$(state_get SERVER_ROLE)" = "1" ]; then
+        err "Ce serveur est un manager Dokploy : commande réservée aux remote servers."
+        return 1
+    fi
+    if [ -z "$ip" ] && [ -z "$key" ]; then
+        manager_status
+        return 0
+    fi
+    old="$(state_get MANAGER_IP)"
+    [ -n "$ip" ] || ip="$old"
+    if ! manager_ip_valid "$ip"; then
+        err "IP du manager invalide : « ${ip} » (IPv4 attendue, ex. 10.0.0.2)."
+        return 1
+    fi
+    if [ -n "$key" ] && ! validate_dokploy_pubkey "$key"; then
+        err "Clé publique invalide (une seule ligne : ssh-ed25519 AAAA… commentaire)."
+        return 1
+    fi
+    port="$(manager_ssh_port)"
+
+    local rc=0
+    dokploy_account_apply || return 1
+    dokploy_sudoers_apply || rc=1
+    dokploy_keys_apply "$ip" "$key" || rc=1
+    dokploy_sshd_apply "$ip" || rc=1
+    dokploy_ufw_apply "$ip" "$port" || rc=1
+    dokploy_fail2ban_apply "$ip" "$old" || rc=1
+    # Persisté même en échec partiel : le prochain init-vps.sh --update
+    # réalignera tout sur cette IP.
+    state_set MANAGER_IP "$ip"
+    if [ "$rc" -eq 0 ]; then
+        ok "Manager ${ip} : accès prêt (utilisateur ${DOKPLOY_USER}, port ${port})."
+    else
+        warn "Manager ${ip} : configuration incomplète, voir les erreurs ci-dessus."
+    fi
+    return "$rc"
+}
+
+# Audit du rôle remote : ce que Dokploy « Validate » vérifie, plus ce qui
+# protège l'accès (restriction d'IP, AllowUsers, ordre UFW).
+check_dokploy_remote() {
+    [ "$(state_get SERVER_ROLE)" = "2" ] || return 0
+    chk_sect "Accès du manager Dokploy"
+    local ip home ak lines bad sshd_cfg allow port ours lim node
+    # Adresse d'annonce du swarm : une IP publique change (Primary IP déplacée,
+    # serveur recréé) et le nœud reste annoncé sur une adresse morte — mesuré.
+    if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
+        node="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)"
+        if ! ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$node"; then
+            chk_fail "Swarm annoncé sur ${node}, adresse absente de ce serveur (IP publique changée ?) — réinitialiser le swarm sur l'IP privée (voir CLAUDE.md)"; fail=$((fail+1))
+        elif [[ "$node" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
+            chk_pass "Swarm annoncé sur l'IP privée ${node}"; pass=$((pass+1))
+        else
+            chk_warn "Swarm annoncé sur l'IP publique ${node} : un changement d'IP le laisserait sur une adresse morte"
+        fi
+    else
+        chk_info "Docker Swarm inactif (Setup Server de Dokploy pas encore lancé ?)"
+    fi
+    ip="$(state_get MANAGER_IP)"
+    if [ -z "$ip" ]; then
+        chk_warn "Manager Dokploy non configuré (sudo vps-helper manager --ip <IP> --key \"<clé>\")"
+        return 0
+    fi
+    if ! id "$DOKPLOY_USER" >/dev/null 2>&1; then
+        chk_fail "Compte ${DOKPLOY_USER} absent (corriger : sudo vps-helper manager --ip ${ip} --key \"<clé>\")"; fail=$((fail+1))
+        return 0
+    fi
+    if [ "$(getent passwd "$DOKPLOY_USER" | cut -d: -f7)" = /bin/bash ]; then
+        chk_pass "Compte ${DOKPLOY_USER} présent, shell bash"; pass=$((pass+1))
+    else
+        chk_fail "Compte ${DOKPLOY_USER} : shell autre que bash (Dokploy l'exige)"; fail=$((fail+1))
+    fi
+    if id -nG "$DOKPLOY_USER" | grep -qw docker; then
+        chk_pass "${DOKPLOY_USER} dans le groupe docker"; pass=$((pass+1))
+    else
+        chk_fail "${DOKPLOY_USER} absent du groupe docker (« Docker Group » de Dokploy en échec)"; fail=$((fail+1))
+    fi
+    if [ ! -f "$DOKPLOY_SUDOERS" ]; then
+        chk_fail "${DOKPLOY_SUDOERS} absent (« Privilege Mode » de Dokploy en échec)"; fail=$((fail+1))
+    elif ! visudo -cf "$DOKPLOY_SUDOERS" >/dev/null 2>&1; then
+        chk_fail "${DOKPLOY_SUDOERS} refusé par visudo -cf"; fail=$((fail+1))
+    elif ! runuser -u "$DOKPLOY_USER" -- sudo -n true >/dev/null 2>&1; then
+        chk_fail "sudo -n refusé pour ${DOKPLOY_USER} malgré ${DOKPLOY_SUDOERS}"; fail=$((fail+1))
+    else
+        chk_pass "sudo sans mot de passe pour ${DOKPLOY_USER} (sudoers valide)"; pass=$((pass+1))
+    fi
+    home="$(getent passwd "$DOKPLOY_USER" | cut -d: -f6)"
+    ak="${home}/.ssh/authorized_keys"
+    lines="$(grep -v '^[[:space:]]*\(#\|$\)' "$ak" 2>/dev/null || true)"
+    bad="$(grep -vF "from=\"${ip}\" " <<< "$lines" || true)"
+    if [ -z "$lines" ]; then
+        chk_fail "Aucune clé du manager dans ${ak}"; fail=$((fail+1))
+    elif [ -n "$bad" ]; then
+        chk_fail "${ak} : $(grep -c . <<< "$bad") clé(s) sans restriction from=\"${ip}\""; fail=$((fail+1))
+    else
+        chk_pass "Clé(s) du manager restreinte(s) à ${ip} (from=)"; pass=$((pass+1))
+    fi
+    sshd_cfg="$(sshd -T 2>/dev/null)"
+    allow="$(awk '$1 == "allowusers" {print $2}' <<< "$sshd_cfg")"
+    if grep -qxF "${DOKPLOY_USER}@${ip}" <<< "$allow" \
+            && ! grep -v -xF "${DOKPLOY_USER}@${ip}" <<< "$allow" | grep -q "^${DOKPLOY_USER}\(@\|$\)"; then
+        chk_pass "AllowUsers : ${DOKPLOY_USER}@${ip} uniquement pour ${DOKPLOY_USER}"; pass=$((pass+1))
+    else
+        chk_fail "AllowUsers non conforme (attendu : ${DOKPLOY_USER}@${ip}) — corriger : sudo vps-helper manager --ip ${ip}"; fail=$((fail+1))
+    fi
+    port="$(manager_ssh_port)"
+    ours="$(ufw_numbered | awk -v ip="$ip" -v p="${port}/tcp" '$2 == p && $3 == "ALLOW" && $5 == ip {print $1; exit}')"
+    lim="$(ufw_numbered | awk -v p="${port}/tcp" '$2 == p && $3 == "LIMIT" {print $1; exit}')"
+    if [ -z "$ours" ]; then
+        chk_fail "UFW : aucune règle SSH (${port}/tcp) pour le manager ${ip}"; fail=$((fail+1))
+    elif [ -n "$lim" ] && [ "$ours" -gt "$lim" ]; then
+        chk_fail "UFW : la règle du manager (#${ours}) suit la limite de débit (#${lim}) — les déploiements seront coupés"; fail=$((fail+1))
+    else
+        chk_pass "UFW : SSH du manager autorisé avant la limite de débit"; pass=$((pass+1))
+    fi
+    if grep -m1 '^ignoreip' /etc/fail2ban/jail.local 2>/dev/null | grep -qw -- "$ip"; then
+        chk_pass "fail2ban : ${ip} en liste blanche"; pass=$((pass+1))
+    else
+        chk_warn "fail2ban : ${ip} absente de ignoreip (un déploiement raté pourrait bannir le manager)"
     fi
 }
 
@@ -3165,15 +3837,41 @@ cmd_check() {
     fi
 
     chk_sect "Ports publiés par Docker"
-    local port_found=0 published
+    # Publié ne veut pas dire exposé : avec nos règles DOCKER-USER, un port
+    # publié est bloqué depuis Internet (sauf 80/443 et le panneau Dokploy tant
+    # qu'il est ouvert). FAIL seulement si rien ne filtre réellement.
+    local published exposed=0 filtering
+    if ! command -v iptables >/dev/null 2>&1; then
+        filtering=unknown
+    elif docker_user_chain_is_empty; then
+        filtering=none
+    elif docker_user_rules | grep -q -- '--comment init-vps'; then
+        filtering=ours
+    else
+        filtering=foreign
+    fi
     while IFS= read -r published; do
         [ -z "$published" ] && continue
         case "$published" in 80/tcp|443/tcp|443/udp) continue ;; esac
-        chk_fail "Port ${published} publié sur toutes les interfaces (exposé si DOCKER-USER ne le filtre pas)"; fail=$((fail+1))
-        port_found=1
+        if [ "$filtering" = "none" ]; then
+            chk_fail "Port ${published} exposé à Internet : publié sur toutes les interfaces, aucune règle DOCKER-USER (corriger : vps-helper docker-firewall apply)"; fail=$((fail+1))
+            exposed=1
+        elif [ "$filtering" != "ours" ]; then
+            chk_warn "Port ${published} publié sur toutes les interfaces, filtrage DOCKER-USER tiers ou illisible : exposition non vérifiable"
+            exposed=1
+        elif [ "$published" = "3000/tcp" ] && [ -f "$DOCKER_USER_DOKPLOY_FILE" ]; then
+            if [ -s /etc/dokploy/traefik/dynamic/acme.json ] && grep -q '"main"[[:space:]]*:' /etc/dokploy/traefik/dynamic/acme.json 2>/dev/null; then
+                chk_warn "Port 3000/tcp (panneau Dokploy) encore ouvert alors qu'un domaine TLS est actif — fermer : vps-helper close-dokploy"
+            else
+                chk_info "Port 3000/tcp (panneau Dokploy) ouvert à $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement, le temps de configurer le domaine — fermer ensuite : vps-helper close-dokploy"
+            fi
+            exposed=1
+        else
+            chk_info "Port ${published} publié, bloqué depuis Internet par DOCKER-USER (joignable depuis les réseaux privés)"
+        fi
     done < <(docker_published_public_ports)
-    if [ "$port_found" -eq 0 ]; then
-        chk_pass "Aucun port publié sur toutes les interfaces en dehors de 80/443"; pass=$((pass+1))
+    if [ "$exposed" -eq 0 ]; then
+        chk_pass "Aucun port exposé à Internet en dehors de 80/443"; pass=$((pass+1))
     fi
     if ! command -v iptables >/dev/null 2>&1; then
         chk_info "DOCKER-USER : iptables absent, état non vérifiable"
@@ -3202,6 +3900,7 @@ cmd_check() {
         fi
     fi
 
+    check_dokploy_remote
     check_container_memory
     check_restart_policies
 
@@ -3242,8 +3941,12 @@ cmd_check() {
     else
         chk_info "Swap : absent"
     fi
-    if ufw status numbered 2>/dev/null | grep -q '3000/tcp'; then
-        chk_info "Port 3000 : ouvert (à fermer après configuration Dokploy)"
+    # Joignable = autorisé par DOCKER-USER (fichier dokploy-ui) : la règle UFW
+    # seule ne dit rien, UFW ne voit pas ce trafic.
+    if [ -f "$DOCKER_USER_DOKPLOY_FILE" ]; then
+        chk_info "Port 3000 : ouvert (à fermer après configuration du domaine : vps-helper close-dokploy)"
+    elif ufw status numbered 2>/dev/null | grep -q '3000/tcp'; then
+        chk_info "Port 3000 : règle UFW résiduelle, sans effet sur un port Docker (nettoyer : vps-helper close-dokploy)"
     else
         chk_info "Port 3000 : fermé"
     fi
@@ -3274,6 +3977,9 @@ cmd_check() {
     if [ "$notify" -eq 1 ]; then
         check_notify_failures
     fi
+    # Code 1 dès qu'un contrôle échoue : utilisable dans un script ou une CI
+    # (auparavant toujours 0). vps-check.service le tolère (ExecStart=-).
+    [ "$fail" -eq 0 ]
 }
 
 case "$CMD" in
@@ -3281,6 +3987,7 @@ case "$CMD" in
     whitelist)      shift; cmd_whitelist "$@" ;;
     unban)          shift; cmd_unban "$@" ;;
     close-dokploy)  cmd_close_dokploy ;;
+    manager)        shift; cmd_manager "$@" ;;
     ssh-keys)       shift; cmd_ssh_keys "$@" ;;
     restart)        shift; cmd_restart "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
@@ -3367,6 +4074,8 @@ EOF
 DOCKER_USER_DIR=/usr/local/lib/docker-user
 DOCKER_USER_APPLY="${DOCKER_USER_DIR}/apply.sh"
 DOCKER_USER_UNIT=/etc/systemd/system/docker-user-rules.service
+# Accès au panneau Dokploy laissé passer par apply.sh (voir dokploy_ui_source).
+DOCKER_USER_DOKPLOY_FILE="${DOCKER_USER_DIR}/dokploy-ui"
 
 # Ports publiés sur 0.0.0.0 / [::], un « port/proto » par ligne, dédoublonnés.
 # `done < <(...)` et non un pipe : la boucle doit s'exécuter dans le shell
@@ -3463,6 +4172,24 @@ iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 80 "${COMMENT[@]}" -j RETURN
 iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 443 "${COMMENT[@]}" -j RETURN
 iptables -A DOCKER-USER -i "$IFACE" -p udp --dport 443 "${COMMENT[@]}" -j RETURN
 
+# Panneau Dokploy (3000/tcp) ouvert à UNE IP/CIDR, tant qu'il n'est pas fermé
+# (vps-helper close-dokploy retire ce fichier). Sans cette règle, la règle UFW
+# qui ouvre 3000 est sans effet : UFW ne voit pas un port publié par Docker.
+# Jamais tout Internet (un Dokploy neuf laisse le premier visiteur créer le
+# compte propriétaire) : toute autre valeur — « any », un masque < /8 — laisse
+# le port bloqué. Pas de miroir IPv6 : la restriction est une IPv4.
+DOKPLOY_UI_FILE=/usr/local/lib/docker-user/dokploy-ui
+DOKPLOY_UI=""
+if [ -r "$DOKPLOY_UI_FILE" ]; then
+    DOKPLOY_UI="$(head -n 1 "$DOKPLOY_UI_FILE" | tr -d '[:space:]')"
+fi
+if [[ "$DOKPLOY_UI" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]{1,2}))?$ ]] \
+        && { [ -z "${BASH_REMATCH[3]}" ] || [ "${BASH_REMATCH[3]}" -ge 8 ]; }; then
+    iptables -A DOCKER-USER -i "$IFACE" -s "$DOKPLOY_UI" -p tcp --dport 3000 "${COMMENT[@]}" -j RETURN
+elif [ -n "$DOKPLOY_UI" ]; then
+    echo "docker-user: ${DOKPLOY_UI_FILE} refusé (« ${DOKPLOY_UI} », une IP/CIDR ≥ /8 attendue) — port 3000 laissé bloqué." >&2
+fi
+
 # Réseaux privés (réseau interne du provider, VPN, autres nœuds Swarm).
 for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
     iptables -A DOCKER-USER -i "$IFACE" -s "$net" "${COMMENT[@]}" -j RETURN
@@ -3503,6 +4230,16 @@ ip6tables -A DOCKER-USER "${COMMENT[@]}" -j RETURN
 APPLYEOF
     chmod +x "$DOCKER_USER_APPLY"
 
+    # Même décision que la règle UFW du port 3000 (dokploy_ui_source).
+    local ui_src
+    ui_src="$(dokploy_ui_source)"
+    if [[ -n "$ui_src" ]]; then
+        printf '%s\n' "$ui_src" > "$DOCKER_USER_DOKPLOY_FILE"
+        chmod 644 "$DOCKER_USER_DOKPLOY_FILE"
+    else
+        rm -f "$DOCKER_USER_DOKPLOY_FILE"
+    fi
+
     backup_file "$DOCKER_USER_UNIT"
     cat > "$DOCKER_USER_UNIT" <<'UNITEOF'
 [Unit]
@@ -3537,6 +4274,7 @@ UNITEOF
         while IFS= read -r p; do
             [[ -z "$p" ]] && continue
             case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
+            [[ "$p" == "3000/tcp" && -n "$ui_src" ]] && continue
             cut_ports+=("$p")
         done < <(docker_published_public_ports)
 
@@ -3583,7 +4321,7 @@ UNITEOF
     else
         "$DOCKER_USER_APPLY"
     fi
-    log_ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp et réseaux privés autorisés ; le reste bloqué)."
+    log_ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp${ui_src:+, 3000/tcp depuis ${ui_src} pour Dokploy} et réseaux privés autorisés ; le reste bloqué)."
 }
 
 ###############################################################################
@@ -3606,6 +4344,10 @@ step_docker_ports_audit() {
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
         case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
+        if [[ "$p" == "3000/tcp" && -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+            log_info "Port 3000/tcp (panneau Dokploy) ouvert à $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement, jusqu'à « sudo vps-helper close-dokploy »."
+            continue
+        fi
         log_warn "Port ${p} publié sur toutes les interfaces (conteneur ou service Swarm)."
         found=1
     done < <(docker_published_public_ports)
@@ -3626,8 +4368,9 @@ step_docker_ports_audit() {
 ###############################################################################
 # Pré-installe Docker avant Dokploy. L'install.sh de Dokploy délègue à
 # get.docker.com, qui déduit le nom de code APT depuis /etc/os-release : sur une
-# version d'Ubuntu/Debian trop récente (ex. 26.04 « resolute »), le dépôt Docker
-# n'existe pas encore et l'installation échoue (« docker: not found »). On
+# version d'Ubuntu/Debian trop récente, le dépôt Docker n'existe pas encore et
+# l'installation échoue (« docker: not found ») — c'était le cas de 26.04
+# « resolute » à sa sortie ; il est publié depuis (vérifié le 29/09/2026). On
 # installe donc Docker nous-mêmes en repliant sur la dernière LTS supportée si
 # le dépôt du codename courant est absent. Une fois Docker présent, Dokploy le
 # détecte et saute cette étape.
@@ -3727,6 +4470,68 @@ step_traefik_tuning() {
     else
         log_warn "vps-helper introuvable — optimisation Traefik ignorée."
     fi
+}
+
+###############################################################################
+# 19 bis. ACCÈS DU MANAGER DOKPLOY (rôle remote) — issue #1
+#
+# Même schéma que step_traefik_tuning : aucune logique ici, tout vit dans
+# `vps-helper manager` (compte dokploy, sudoers, authorized_keys restreint,
+# AllowUsers, UFW, fail2ban), qui sert aussi à changer de manager plus tard.
+# La clé n'est connue qu'à la collecte : en mode mise à jour, vps-helper garde
+# celle déjà posée et réaligne tout sur $MANAGER_IP.
+###############################################################################
+# Rôle remote : swarm initialisé sur l'IP privée AVANT le Setup de Dokploy,
+# qui le trouve alors actif et saute sa propre initialisation (setupSwarm :
+# « Already part of a Docker Swarm »). Seul --advertise-addr est fixé : un
+# --listen-addr privé dépendrait de l'ordre d'apparition des interfaces au
+# boot, et 2377 reste de toute façon fermé en entrée par UFW.
+# Swarm déjà actif sur une autre adresse : jamais corrigé ici — quitter le
+# swarm supprimerait services et réseaux overlay en production.
+step_remote_swarm() {
+    log_step "Docker Swarm sur l'IP privée (remote)"
+    if [[ -z "$ADVERTISE_ADDR" ]]; then
+        ADVERTISE_ADDR="$(detect_private_addr)"
+        [[ -n "$ADVERTISE_ADDR" ]] && log_info "IP privée détectée : ${ADVERTISE_ADDR}."
+    fi
+    local state node
+    state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)"
+    if [[ "$state" == "active" ]]; then
+        node="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null || true)"
+        if [[ -n "$ADVERTISE_ADDR" && "$node" == "$ADVERTISE_ADDR" ]]; then
+            log_info "Swarm déjà actif sur ${node}, rien à faire."
+        elif ! validate_local_ipv4 "$node"; then
+            log_warn "Swarm annoncé sur ${node}, adresse qui n'est PLUS sur ce serveur (IP publique changée ?). Aucune correction automatique : voir « vps-helper check » et CLAUDE.md (réinitialiser le swarm sur l'IP privée, puis relancer le Setup Server de Dokploy)."
+        else
+            log_warn "Swarm annoncé sur ${node} (initialisé par Dokploy ?), et non sur l'IP privée ${ADVERTISE_ADDR:-(aucune)} : un changement d'IP le laisserait sur une adresse morte. Aucune correction automatique."
+        fi
+        return
+    fi
+    if [[ -z "$ADVERTISE_ADDR" ]]; then
+        log_warn "Aucune IP privée : swarm non initialisé, Dokploy le fera sur l'IP publique."
+        return
+    fi
+    if docker swarm init --advertise-addr "$ADVERTISE_ADDR" >/dev/null 2>&1; then
+        log_ok "Swarm initialisé sur l'IP privée ${ADVERTISE_ADDR} (le Setup Server de Dokploy le réutilisera)."
+    else
+        log_warn "docker swarm init --advertise-addr ${ADVERTISE_ADDR} a échoué : Dokploy initialisera le swarm lui-même (IP publique)."
+    fi
+}
+
+step_dokploy_remote() {
+    log_step "Accès du manager Dokploy (compte dokploy)"
+    if [[ -z "$MANAGER_IP" ]]; then
+        log_info "Manager non renseigné : compte dokploy non créé. Plus tard : sudo vps-helper manager --ip <IP> --key \"<clé>\""
+        return
+    fi
+    if [[ ! -x /usr/local/bin/vps-helper ]]; then
+        log_warn "vps-helper introuvable — accès du manager non configuré."
+        return
+    fi
+    local -a args=(--ip "$MANAGER_IP")
+    [[ -n "$DOKPLOY_MANAGER_KEY" ]] && args+=(--key "$DOKPLOY_MANAGER_KEY")
+    /usr/local/bin/vps-helper manager "${args[@]}" \
+        || log_warn "Accès du manager incomplet (voir les messages ci-dessus) — corriger puis : sudo vps-helper manager --ip ${MANAGER_IP} --key \"<clé>\""
 }
 
 ###############################################################################
@@ -3946,7 +4751,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/vps-helper check --notify
+# « - » : `check` sort en 1 dès qu'un contrôle échoue. Sans lui, chaque audit
+# en échec laisserait une unit « failed » de plus, que check signalerait à son tour.
+ExecStart=-/usr/local/bin/vps-helper check --notify
 EOF
 
     cat > /etc/systemd/system/vps-check.timer <<'EOF'
@@ -4125,6 +4932,7 @@ DOKPLOY_RESTRICT_IP="${DOKPLOY_RESTRICT_IP}"
 ADVERTISE_ADDR="${ADVERTISE_ADDR}"
 SERVER_ROLE="${SERVER_ROLE}"
 DOKPLOY_PORT_CLOSED="${DOKPLOY_PORT_CLOSED}"
+MANAGER_IP="${MANAGER_IP}"
 SSH_PORT="${SSH_PORT}"
 NOTIFY_ENABLED="${NOTIFY_ENABLED}"
 AUTO_REBOOT="${AUTO_REBOOT}"
@@ -4200,9 +5008,27 @@ dokploy_has_tls_domain() {
 #     serveur réel, `check` annonçait « port 3000 fermé » alors que docker-proxy
 #     écoutait sur 0.0.0.0:3000 — la règle UFW avait été supprimée, le port
 #     restait bel et bien exposé.
+#   Côté Docker, publié ne veut pas dire joignable : DOCKER-USER bloque 3000
+#   sauf si l'accès au panneau est ouvert (fichier dokploy-ui), ou si la
+#   chaîne est vide (rien ne filtre).
 dokploy_port_is_open() {
     ufw status 2>/dev/null | grep -q '3000/tcp' && return 0
-    docker_published_public_ports 2>/dev/null | grep -qx '3000/tcp'
+    docker_published_public_ports 2>/dev/null | grep -qx '3000/tcp' || return 1
+    [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]] && return 0
+    command -v iptables &>/dev/null && docker_user_chain_is_empty
+}
+
+# Remote déjà ajouté au manager ? Le « Setup Server » de Dokploy crée
+# /etc/dokploy sur le remote (server-setup.ts) : c'est la trace sur disque.
+dokploy_remote_added() {
+    [[ -d /etc/dokploy ]]
+}
+
+# RFC1918 : le Cloud Firewall Hetzner ne filtre pas les réseaux privés
+# (docs.hetzner.com/cloud/firewalls/faq : « we consider the private networks
+# to be secure »), une IP publique si.
+is_private_ipv4() {
+    [[ "$1" =~ ^10\. || "$1" =~ ^192\.168\. || "$1" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]
 }
 
 # Sépare deux étapes par une ligne vide, sauf avant la première : sinon la
@@ -4262,9 +5088,15 @@ print_summary() {
             # Ne pas annoncer une URL qui ne répond plus : une fois le port
             # fermé, l'interface passe par le domaine configuré dans Dokploy.
             if dokploy_port_is_open; then
-                echo "Dokploy           : http://${SERVER_IP}:3000"
-            else
+                if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+                    echo "Dokploy           : http://${SERVER_IP}:3000 (depuis $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") seulement)"
+                else
+                    echo "Dokploy           : http://${SERVER_IP}:3000"
+                fi
+            elif dokploy_has_tls_domain; then
                 echo "Dokploy           : installé — port 3000 fermé, accès par le domaine configuré"
+            else
+                echo "Dokploy           : installé — port 3000 fermé, accès par tunnel SSH (voir ci-dessous)"
             fi
         else
             echo "Rôle              : Remote server — prêt à être ajouté depuis Dokploy (Settings → Servers → Add Server)"
@@ -4301,7 +5133,15 @@ print_summary() {
                 echo "${step_n}. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
                 step_n=$((step_n+1))
                 step_sep
-                echo "${step_n}. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
+                # Jamais d'URL publique sans restriction : un Dokploy neuf laisse
+                # le premier visiteur créer le compte propriétaire.
+                if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
+                    echo "${step_n}. Depuis $(head -n 1 "$DOCKER_USER_DOKPLOY_FILE") : ouvrir http://${SERVER_IP}:3000, créer le compte propriétaire, configurer le domaine et le TLS."
+                    echo "     Pare-feu Hetzner (Cloud Firewall) : y autoriser 3000/tcp depuis cette IP le temps de la configuration."
+                else
+                    echo "${step_n}. Ouvrir Dokploy par un tunnel SSH, créer le compte propriétaire, configurer le domaine et le TLS :"
+                    echo "     $(dokploy_tunnel_hint)"
+                fi
                 step_n=$((step_n+1))
             fi
 
@@ -4316,15 +5156,29 @@ print_summary() {
                 # seul persiste le choix dans config.env. Un ufw delete manuel
                 # serait rouvert par step_ufw_base à la prochaine relance.
                 echo "     sudo vps-helper close-dokploy"
+                echo "     puis retirer 3000/tcp du pare-feu Hetzner s'il y a été ajouté."
                 step_n=$((step_n+1))
                 step_sep
                 echo "${step_n}. Désactiver l'accès direct via ip:port dans les réglages Dokploy."
                 step_n=$((step_n+1))
             fi
-        else
+        elif [[ -z "$MANAGER_IP" ]]; then
             step_sep
-            echo "${step_n}. Ajouter ce serveur depuis le manager Dokploy : Settings → Servers → Add Server"
-            echo "     IP : ${SERVER_IP} · Port SSH : ${SSH_PORT} · Utilisateur : ${ADMIN_USER}"
+            echo "${step_n}. Donner accès au manager Dokploy (clé générée dans Dokploy : Settings → SSH Keys) :"
+            echo "     sudo vps-helper manager --ip <IP_DU_MANAGER> --key \"<clé publique>\""
+            step_n=$((step_n+1))
+        elif ! dokploy_remote_added; then
+            # IP locale par laquelle le manager joint ce serveur : la privée
+            # s'ils partagent un réseau, la publique sinon.
+            local reach_ip
+            reach_ip="$(ip -4 route get "$MANAGER_IP" 2>/dev/null | grep -oP '\bsrc \K[0-9.]+' | head -n1 || true)"
+            step_sep
+            echo "${step_n}. Dans le Dokploy du manager : Settings → Servers → Add Server"
+            echo "     IP : ${reach_ip:-$SERVER_IP} · Port SSH : ${SSH_PORT} · Utilisateur : dokploy · Clé SSH : celle fournie ici"
+            echo "     puis « Setup Server » et « Validate » (Privilege Mode et Docker Group au vert)."
+            if ! is_private_ipv4 "$MANAGER_IP"; then
+                echo "     Pare-feu Hetzner : le manager passe par l'IP publique — y autoriser ${SSH_PORT}/tcp depuis ${MANAGER_IP}."
+            fi
             step_n=$((step_n+1))
         fi
 
@@ -4383,6 +5237,12 @@ ask_new_options() {
     fi
     if ! state_has AUTO_REBOOT; then
         collect_auto_reboot
+    fi
+    # Remote provisionné avant l'issue #1 : aucune clé du manager n'est posée.
+    # Une réponse vide est persistée (MANAGER_IP="") et n'est plus reposée —
+    # `vps-helper manager` reste le moyen de le faire plus tard.
+    if [[ "$SERVER_ROLE" == "2" ]] && ! state_has MANAGER_IP; then
+        collect_manager
     fi
     return 0
 }
@@ -4450,6 +5310,9 @@ main() {
         if [[ "$SERVER_ROLE" == "1" ]]; then
             collect_dokploy_restrict_ip
             collect_advertise_addr
+        else
+            collect_manager
+            collect_remote_swarm_addr
         fi
         collect_notify
         collect_auto_reboot
@@ -4474,6 +5337,7 @@ main() {
     fi
     step_hostname
     step_create_admin
+    step_admin_sudo
     step_fail2ban
     step_ssh_phase1
     step_ufw_base
@@ -4495,7 +5359,10 @@ main() {
         step_traefik_tuning
     else
         log_info "Rôle 'remote server' : Dokploy ne sera pas installé ici, il sera ajouté depuis le manager central."
+        # ensure_docker AVANT : le groupe docker doit exister pour y mettre dokploy.
         ensure_docker
+        step_remote_swarm
+        step_dokploy_remote
     fi
     step_notify
     step_save_state

@@ -6,10 +6,10 @@
 
 Un seul script bash, 100 % interactif, idempotent — du serveur nu au serveur durci et prêt à déployer.
 
-[![Lint](https://github.com/studiokyne/init-vps/actions/workflows/lint.yml/badge.svg)](https://github.com/studiokyne/init-vps/actions/workflows/lint.yml)
+[![Lint](https://github.com/agence-lumia/init-vps/actions/workflows/lint.yml/badge.svg)](https://github.com/agence-lumia/init-vps/actions/workflows/lint.yml)
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-blue.svg)](LICENSE)
 [![Shell: bash](https://img.shields.io/badge/Shell-bash-121011.svg?logo=gnu-bash&logoColor=white)](init-vps.sh)
-[![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04_LTS-E95420.svg?logo=ubuntu&logoColor=white)](https://ubuntu.com)
+[![Ubuntu 24.04 / 26.04](https://img.shields.io/badge/Ubuntu-24.04_%7C_26.04_LTS-E95420.svg?logo=ubuntu&logoColor=white)](https://ubuntu.com)
 
 </div>
 
@@ -29,7 +29,7 @@ Un seul script bash, 100 % interactif, idempotent — du serveur nu au serveur d
 
 ## 📋 Prérequis
 
-- Ubuntu 24.04 LTS ou Debian (testé sur Ubuntu 24.04, compatible futures LTS)
+- Ubuntu 26.04 ou 24.04 LTS, ou Debian (testé sur Ubuntu 24.04 et 26.04)
 - Accès **root** au serveur (`sudo` ou connexion en root)
 - Un serveur **fraîchement installé** (le script durcit et verrouille l'accès)
 
@@ -40,14 +40,14 @@ Un seul script bash, 100 % interactif, idempotent — du serveur nu au serveur d
 ### Commande unique (recommandée)
 
 ```bash
-curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
+curl -fsSL https://github.com/agence-lumia/init-vps/releases/latest/download/init-vps.sh \
   -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh
 ```
 
 ### Clone + exécution locale
 
 ```bash
-git clone https://github.com/studiokyne/init-vps.git
+git clone https://github.com/agence-lumia/init-vps.git
 cd init-vps
 sudo ./init-vps.sh
 ```
@@ -74,7 +74,7 @@ Alternative — premier passage à cette version, ou `vps-helper` trop ancien po
 connaître `self-update` :
 
 ```bash
-curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
+curl -fsSL https://github.com/agence-lumia/init-vps/releases/latest/download/init-vps.sh \
   -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh --update
 ```
 
@@ -85,7 +85,7 @@ curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-
 
 La configuration est relue depuis `/etc/init-vps/config.env` : **aucune question
 déjà répondue n'est reposée**, et toutes les étapes sont rejouées. Seules les options
-apparues depuis la version qui a provisionné le serveur (port SSH, notifications, redémarrage automatique) sont
+apparues depuis la version qui a provisionné le serveur (port SSH, notifications, redémarrage automatique, manager Dokploy d'un remote) sont
 proposées, une seule fois — un refus est mémorisé. Elles sont idempotentes, donc
 celles déjà en place sont simplement ignorées — y compris le verrouillage SSH, qui
 ne redemande aucune confirmation. La mise à jour des paquets système est volontairement
@@ -123,6 +123,42 @@ Un résumé final est affiché et sauvegardé dans `/var/log/init-vps.log`.
 
 ---
 
+## 🛰️ Manager et remote servers Dokploy
+
+**Manager (rôle 1)** — le panneau Dokploy (port 3000) n'est **jamais ouvert à tout
+Internet** : un Dokploy neuf laisse le premier visiteur créer le compte propriétaire.
+Avec une IP de restriction saisie à l'installation, le port lui est ouvert, à elle
+seule ; sinon il reste fermé et le panneau s'ouvre par tunnel SSH :
+
+```bash
+ssh -L 3000:127.0.0.1:3000 admin@<IP_DU_MANAGER>   # puis http://127.0.0.1:3000
+```
+
+Une fois le domaine et le TLS configurés : `sudo vps-helper close-dokploy`.
+
+**Remote server (rôle 2)** — piloté par le manager avec un utilisateur **non-root**
+(Dokploy ≥ v0.29.0). L'installation demande l'IP du manager (privée si les deux
+serveurs partagent un réseau Hetzner) et la clé publique générée dans Dokploy
+(*Settings → SSH Keys*), puis :
+
+- crée le compte `dokploy` (bash, groupe `docker`, `sudo` sans mot de passe validé
+  par `visudo`) et n'y pose que la clé du manager, restreinte à son IP (`from=`) ;
+- l'autorise dans `AllowUsers`, dans UFW (avant la limite de débit) et dans la liste
+  blanche fail2ban — `PermitRootLogin no` reste en place ;
+- initialise Docker Swarm sur l'**IP privée**, avant le *Setup Server* de Dokploy :
+  un changement d'IP publique (Primary IP déplacée) ne casse plus le swarm.
+
+Dans Dokploy : *Settings → Servers → Add Server*, avec l'IP privée du remote,
+l'utilisateur `dokploy` et le port SSH — le résumé de fin d'installation les affiche.
+Changer de manager : `sudo vps-helper manager --ip <IP> --key "<clé>"`.
+
+> [!NOTE]
+> L'onglet *Security* de Dokploy signale à tort « Password Auth : Enabled » et
+> « Fail2Ban : SSH Protection Not Enabled » : il ne lit que `/etc/ssh/sshd_config`
+> (pas `sshd_config.d/`) et une partie de `jail.local`. `vps-helper check` fait foi.
+
+---
+
 ## 🏷️ Convention de nommage des hostnames
 
 Format : `type-objectif-zone-numero`
@@ -150,11 +186,12 @@ Commande d'administration installée sur le serveur lors de l'initialisation.
 | `vps-helper whitelist <IP>`    | Ajouter une IP de confiance (jamais bannie par fail2ban)      |
 | `vps-helper unban <IP>`        | Débannir une IP bannie par fail2ban                           |
 | `vps-helper close-dokploy`     | Fermer l'accès direct au port 3000 (Dokploy)                  |
+| `vps-helper manager [--ip IP] [--key "clé"]` | Remote : donner accès au manager Dokploy, ou en changer (sans argument : état) |
 | `vps-helper ssh-keys <list\|add\|remove> [user]` | Gérer les clés SSH d'un utilisateur (défaut : compte admin) |
 | `vps-helper restart <service>` | Redémarrer un service : `ssh`, `fail2ban`, `docker`           |
 | `vps-helper logs <conteneur>`  | Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter) |
 | `vps-helper update`            | Mettre à jour le système (sécurité incluse)                   |
-| `vps-helper check [--notify]`  | Auditer le serveur en lecture seule (PASS / FAIL / WARN / INFO) ; `--notify` envoie les FAIL au webhook |
+| `vps-helper check [--notify]`  | Auditer le serveur en lecture seule (PASS / FAIL / WARN / INFO), code 1 si un FAIL ; `--notify` envoie les FAIL au webhook |
 | `vps-helper notify-set`        | Poser ou changer l'URL du webhook, puis envoi de test         |
 | `vps-helper notify-test [fail]`| Notification de test (`fail` : alerte qui notifie)            |
 | `vps-helper reboot-status`     | Redémarrage requis / planifié                                 |
@@ -283,4 +320,4 @@ La version installée sur un serveur est accessible via `vps-helper version`, qu
 
 ## 📄 Licence
 
-[MIT](LICENSE) — © 2026 Studio Kyne and contributors
+[MIT](LICENSE) — © 2026 Lümia and contributors
