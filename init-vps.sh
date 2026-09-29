@@ -2406,9 +2406,14 @@ MEM_EVENTS_MIN_AGE=86400
 MEM_RECLAIM_MIN_PAGES=16
 # Garde-fou thrashing : code mappé évincé puis relu depuis le disque sans OOM —
 # pgsteal non nul mais pgmajfault élevé. FAIL si pgmajfault > ce plancher ET
-# pgmajfault × 10 > max. Seuil PROVISOIRE : ce cas n'a jamais été mesuré avec
-# ces compteurs (méthode de test dans CLAUDE.md).
-MEM_MAJFAULT_FLOOR=100
+# pgmajfault × 10 > max.
+# Plancher relevé de 100 à 1000 (29/09/2026, 3 j après un reboot, 15 conteneurs) :
+#   - bruit de fond : 19 à 311 majfaults (chargement du binaire et des libs à
+#     froid au démarrage, pas des dépassements) — nginx Coyac à 135 pour 328
+#     reclaims de cache bénins (448 pages libérées chacun) tombait en FAIL ;
+#   - vrais cas : wordpress (PHP-FPM) à 39 032 et 94 385 majfaults, limite 1G
+#     saturée (memory.peak = memory.max).
+MEM_MAJFAULT_FLOOR=1000
 
 human_bytes() { numfmt --to=iec --suffix=o "$1" 2>/dev/null || echo "${1} o"; }
 
@@ -2468,8 +2473,12 @@ check_container_memory() {
     if [ -z "$klog" ]; then
         chk_warn "Journal noyau illisible : OOM kills non vérifiables"
     else
-        oom_lines="$(grep -E 'Out of memory|oom-kill:' <<< "$klog" || true)"
-        cg_n=$(grep -c 'Memory cgroup out of memory' <<< "$oom_lines" || true)
+        # Casse : le noyau écrit « Out of memory: Killed process » (OOM global) mais
+        # « Memory cgroup out of memory: Killed process » (OOM de cgroup, o minuscule,
+        # mm/oom_kill.c). Filtrer sur « Out of memory » seul perdait tous les OOM de
+        # cgroup : cg_n restait à 0 et le contrôle affichait un faux PASS.
+        oom_lines="$(grep -E '[Oo]ut of memory|oom-kill:' <<< "$klog" || true)"
+        cg_n=$(grep -c 'Memory cgroup out of memory: Kill' <<< "$oom_lines" || true)
         global_n=$(grep 'Out of memory: Kill' <<< "$oom_lines" | grep -vc 'Memory cgroup' || true)
         while read -r count id; do
             [ -z "$id" ] && continue
@@ -2499,7 +2508,7 @@ check_container_memory() {
         return
     fi
     local now full pid started dir max_ev oom_ev limit peak age start_s ratio
-    local steal majf benign
+    local steal majf benign swp
     local -a cheap=()
     local ok_n=0 unlimited_n=0 unreadable_n=0
     now=$(date +%s)
@@ -2538,7 +2547,10 @@ check_container_memory() {
                 continue
             fi
             if [ "$majf" -gt "$MEM_MAJFAULT_FLOOR" ] && [ $((majf * 10)) -gt "$max_ev" ]; then
-                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} relectures disque de code en $(human_age "$age") — limite $(human_bytes "$limit")"
+                # pgmajfault compte aussi les retours depuis le swap : Docker accorde
+                # par défaut autant de swap que la limite mémoire (memory.swap.max).
+                swp=$(cat "${dir}/memory.swap.current" 2>/dev/null || echo 0)
+                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} défauts de page majeurs (code relu ou swap) en $(human_age "$age") — limite $(human_bytes "$limit"), swap $(human_bytes "${swp:-0}")"
                 fail=$((fail+1))
                 continue
             fi

@@ -212,7 +212,7 @@ conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
 | `oom_kill > 0` | FAIL |
 | `max > 0`, `memory.stat` illisible | FAIL |
 | `max > 0`, `pgsteal / max < 16` | FAIL « sans mémoire récupérable » |
-| `max > 0`, `pgmajfault > 100` et `> max / 10` | FAIL « thrashing » |
+| `max > 0`, `pgmajfault > 1000` et `> max / 10` | FAIL « thrashing » (swap du conteneur affiché) |
 | sinon | INFO, puis logique d'âge habituelle |
 
 `pgsteal` et `pgmajfault` sont lus en correspondance exacte (`$1 == "pgsteal"`) :
@@ -226,10 +226,31 @@ un motif lâche prendrait `pgsteal_direct`.
 - **`workingset_refault_file`** : 374 007 sur le cas sain (`wp` relit ses fichiers
   PHP à chaque cycle).
 
-⚠️ Le garde-fou `pgmajfault` (`MEM_MAJFAULT_FLOOR=100`) est **provisoire** : il
-vise l'incident historique (code PHP mappé évincé sans OOM — `pgsteal` non nul,
-`pgmajfault` élevé), jamais mesuré avec ces compteurs. Méthode de test
-reproductible (~1 min) :
+**OOM de cgroup : attention à la casse.** Le noyau écrit « `Out of memory: Killed
+process` » pour un OOM global, mais « `Memory cgroup out of memory: Killed process` »
+(o minuscule, `mm/oom_kill.c`) pour un OOM de cgroup. L'ancien filtre sur
+`Out of memory` perdait tous les OOM de cgroup, d'où un faux PASS. Le motif
+`[Oo]ut of memory` couvre les deux formes.
+
+Garde-fou `pgmajfault` : `MEM_MAJFAULT_FLOOR=1000` (29/09/2026). Il vise l'incident
+historique (code PHP mappé évincé sans OOM : `pgsteal` non nul, `pgmajfault` élevé).
+Plancher mesuré 3 jours après un reboot, sur 15 conteneurs :
+
+- bruit de fond : 19 à 311 majfaults (binaire et bibliothèques chargés à froid) ; à
+  100, un nginx à 135 pour 328 reclaims de cache bénins tombait en FAIL ;
+- vrais cas : wordpress (PHP-FPM) à 39 032 et 94 385, limite 1G saturée
+  (`memory.peak` = `memory.max`).
+
+⚠️ **`pgmajfault` compte aussi les retours depuis le swap**, pas seulement le code
+relu depuis le disque. Or **Docker accorde par défaut à chaque conteneur autant de
+swap que sa limite mémoire** : `memory.swap.max` = `memory.max` quand
+`--memory-swap` n'est pas fixé. Mesuré sur Docker 29.8.1, aussi bien pour un
+`docker run --memory 64m` que pour un service Swarm `--limit-memory 64m` (cas des
+déploiements Dokploy). Un conteneur à sa limite pagine donc dans le swap de l'hôte
+au lieu d'être tué : le message de thrashing affiche `memory.swap.current` pour
+le distinguer.
+
+Méthode de test reproductible (~1 min) :
 
 1. `docker update --memory 128m --memory-swap 128m <cron>`, puis `docker restart <cron>` ;
 2. `docker exec <cron> wp cron event run wp_version_check wp_update_plugins wp_update_themes` ;
