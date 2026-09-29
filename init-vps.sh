@@ -3396,7 +3396,13 @@ cmd_reboot_status() {
     if [ -f "$REBOOT_PLANNED" ]; then
         local when
         read -r when _ < "$REBOOT_PLANNED"
-        info "Planifié le $(fmt_when "$when") (± 30 min) — reporter : vps-helper reboot-skip"
+        # Serveur redémarré entre-temps (à la main, ou éteint/rallumé) : plus
+        # rien n'est requis, reboot_run effacera la planification sans redémarrer.
+        if [ -f /var/run/reboot-required ]; then
+            info "Planifié le $(fmt_when "$when") (± 30 min) — reporter : vps-helper reboot-skip"
+        else
+            info "Planification du $(fmt_when "$when") caduque (plus rien de requis) : effacée à la fenêtre, sans redémarrage."
+        fi
     fi
 }
 
