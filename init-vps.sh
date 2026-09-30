@@ -2417,6 +2417,7 @@ http:
         defaultEncoding: br
         minResponseBodyBytes: 1024
         excludedContentTypes:
+          - text/event-stream
           - image/jpeg
           - image/png
           - image/gif
@@ -2437,6 +2438,24 @@ FRAGEOF
         ok "Middleware « compression » ajouté à dynamic/middlewares.yml."
     else
         info "Middleware « compression » déjà présent."
+    fi
+
+    # --- 1b. SSE (text/event-stream) jamais compressé ---
+    # Le middleware est global à websecure : compressé, un flux SSE est mis en
+    # tampon et n'arrive plus au fil de l'eau (MCP de Baserow, streaming IA…).
+    # Middleware posé par une version antérieure : on ajoute l'exclusion.
+    # includedContentTypes et excludedContentTypes s'excluent : liste blanche
+    # personnalisée → on n'y touche pas.
+    if [[ "$(yq '.http.middlewares.compression.compress.includedContentTypes // [] | length' "$mconf")" != "0" ]]; then
+        info "Compression en liste blanche (includedContentTypes) — exclusion SSE non gérée."
+    elif ! yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf" \
+            | grep -qx 'text/event-stream'; then
+        [[ -f "${mconf}.bak-${stamp}" ]] || cp -a "$mconf" "${mconf}.bak-${stamp}"
+        yq -i '.http.middlewares.compression.compress.excludedContentTypes = ["text/event-stream"] + (.http.middlewares.compression.compress.excludedContentTypes // [])' "$mconf"
+        changed=1
+        ok "Flux SSE (text/event-stream) exclus de la compression."
+    else
+        info "Flux SSE déjà exclus de la compression."
     fi
 
     # Sauvegarde de traefik.yml avant toute modification (une seule fois),
@@ -3921,6 +3940,17 @@ cmd_check() {
             chk_pass "Middleware compression attaché à websecure"; pass=$((pass+1))
         else
             chk_fail "Compression non attachée (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
+        fi
+        local mconf="/etc/dokploy/traefik/dynamic/middlewares.yml"
+        if [[ "$(yq '.http.middlewares.compression // "null"' "$mconf" 2>/dev/null)" == "null" ]]; then
+            :
+        elif [[ "$(yq '.http.middlewares.compression.compress.includedContentTypes // [] | length' "$mconf" 2>/dev/null)" != "0" ]]; then
+            chk_info "Compression en liste blanche (includedContentTypes) — SSE non vérifié"
+        elif yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf" 2>/dev/null \
+                | grep -qx 'text/event-stream'; then
+            chk_pass "Flux SSE (text/event-stream) exclus de la compression"; pass=$((pass+1))
+        else
+            chk_fail "Flux SSE compressés : MCP/streaming bloqués (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
         fi
     fi
 

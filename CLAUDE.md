@@ -55,6 +55,12 @@ texte littéral pour `HELPEREOF` comme `FRAGEOF`. Ne pas le renommer.
 
 Points clés :
 - Le middleware s'appelle `compression` (référencé `compression@file`) — nom neutre, sans préfixe `sk-`.
+- **`text/event-stream` toujours dans `excludedContentTypes`** : le middleware est global à
+  `websecure`, et un flux SSE compressé est mis en tampon — rien n'arrive au client. Constaté
+  sur le MCP d'un Baserow déployé via Dokploy (même effet sur tout streaming IA). Un serveur
+  dont le middleware existe déjà reçoit l'exclusion en tête de liste (étape 1b, idempotente) ;
+  une liste blanche `includedContentTypes` n'est pas touchée (les deux options s'excluent).
+  `check` : FAIL si absente.
 - HTTP/3 = QUIC sur **UDP/443** : `step_ufw_base` ouvre `443/udp`, et `cmd_traefik_tuning` le garantit aussi (cas d'un serveur provisionné avant l'ajout de cette règle).
 - Le patch utilise `yq` (mikefarah, téléchargé si absent) et un merge profond (`eval-all ... ireduce`) pour **préserver** les middlewares gérés par Dokploy (`redirect-to-https`, `addprefix-*`, etc.). Jamais de réécriture destructive.
 
