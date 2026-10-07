@@ -320,6 +320,51 @@ ne tournent que toutes les 12 h.
 est déjà atteinte avec un reclaim de cache efficace. Un conteneur sans
 limite (`max`) n'est pas « throttlable » : il est seulement compté.
 
+### Démon Docker (étape 15) — `daemon.json` fusionné, plages réseau élargies
+
+`step_docker_log_limits` **fusionne** deux clés dans `daemon.json` (python3, temporaire
+dans `/etc/docker` puis `mv`), sans jamais modifier une clé déjà présente. L'ancienne
+version réécrivait le fichier entier :
+
+- `log-opts` : 10 Mo × 3 par conteneur ;
+- `default-address-pools` : `172.16.0.0/12` en `/24`. Par défaut Docker n'a qu'une
+  trentaine de réseaux bridge (172.17–31 en /16, 192.168 en /20), et **chaque site WordPress
+  en consomme deux** (`default` + `backend`). Mesuré le 07/10/2026 : environ 9 sites de
+  marge sur le serveur client. Docker évite seul les routes de l'hôte — il a sauté
+  `172.31.0.0/16`, qui contient la passerelle Hetzner `172.31.1.1`, pour passer en 192.168.
+  Les réseaux existants gardent leur plage.
+
+Une modification **redémarre Docker**, donc tous les conteneurs (pas de `live-restore`,
+incompatible avec Swarm) : environ une minute, accepté. JSON invalide : `log_warn`, fichier
+laissé tel quel. `check` lit la valeur **effective** (`docker info`), pas le fichier.
+
+### `vps-helper check` — overlays Swarm et réseau privé
+
+Le Swarm prend ses overlays dans `10.0.0.0/8` (ingress `10.0.0.0/24`, dokploy-network
+`10.0.1.0/24`), et le réseau privé Hetzner est `10.0.0.0/16` : les **plages** se recouvrent
+sur les deux serveurs. Mesuré le 07/10/2026 : **sans conflit réel**. Tous les conteneurs
+joignent l'autre serveur par la passerelle de leur bridge, l'ingress n'a que son point
+d'entrée (aucun service publié en mode ingress), et aucune adresse utile n'est dans
+`10.0.1.0/24`.
+
+`check_overlay_overlap` ne signale donc (FAIL) qu'un overlay **utilisé par un conteneur
+local** (hors `ingress-endpoint` / `lb-*`) **et** contenant une adresse dont l'hôte a
+besoin : ses IPv4 hors Docker, ses passerelles, `MANAGER_IP`. Le seul recouvrement des plages
+serait un avertissement permanent, impossible à corriger sans recréer le Swarm. Cas visé :
+Dokploy publié un jour en mode ingress, dont le conteneur ne joindrait plus ses remotes.
+
+⚠️ Un test SSH en rafale vers le manager depuis un remote échoue à la 6ᵉ connexion en
+30 s : c'est la règle `limit` d'UFW, pas un problème réseau (vu pendant le diagnostic).
+
+### `vps-helper check` — santé des conteneurs
+
+`check_container_health` (section « Santé des conteneurs ») : FAIL pour un conteneur
+`unhealthy`, un conteneur en `restarting`, et un conteneur **Compose** à politique `no`
+terminé avec un code ≠ 0 (l'`init` du template WordPress : nginx en dépend et ne démarre
+pas). Avant, un healthcheck en échec ou une boucle de redémarrage laissaient `check` vert —
+`check_restart_policies` ne lit que la politique. Les tâches Swarm arrêtées portent aussi
+la politique `no`, mais pas de label `com.docker.compose.project` : elles sont ignorées.
+
 Les fonctions `check_*` incrémentent `pass`/`fail` de `cmd_check` par portée
 dynamique ; `chk_fail` mémorise aussi le message dans `CHK_FAIL_MSGS` (utilisé
 par `--notify`), `chk_warn` compte les avertissements sans faire échouer.

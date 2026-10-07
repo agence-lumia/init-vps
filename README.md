@@ -108,7 +108,7 @@ le mode mise à jour ; le drapeau ne fait que répondre « oui » d'avance.
 | 1   | Mise à jour du système                              | 12  | Fuseau horaire / NTP / logs journald              |
 | 2   | Définition du hostname                              | 13  | MOTD personnalisé                                 |
 | 3   | Compte admin (sudo) + clé(s) SSH                    | 14  | Commande d'aide `vps-helper`                      |
-| 4   | fail2ban (activé **avant** l'ouverture SSH)         | 15  | Limitation des logs Docker                        |
+| 4   | fail2ban (activé **avant** l'ouverture SSH)         | 15  | Démon Docker : logs, plages réseau                |
 | 5   | Durcissement SSH — phase 1 (transition)             | 16  | Pare-feu des ports publiés par Docker             |
 | 6   | UFW (pare-feu, dont UDP/443 pour HTTP/3)            | 17  | Audit des ports publiés (lecture seule)           |
 | 7   | Durcissement SSH — phase 2 (verrouillage)           | 18  | Installation de Dokploy                           |

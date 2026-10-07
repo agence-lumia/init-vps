@@ -41,7 +41,7 @@
 #  12. Fuseau horaire / NTP / limites des logs journald
 #  13. MOTD personnalisé (design uniforme à la connexion SSH)
 #  14. Commande d'aide vps-helper (whitelist, ssh-keys, restart, logs, update...)
-#  15. Limitation des logs Docker (rotation 10 Mo x 3 par conteneur)
+#  15. Démon Docker : rotation des logs (10 Mo x 3), plages réseau élargies
 #  16. Pare-feu des ports publiés par Docker (chaîne DOCKER-USER + unit
 #      systemd) — UFW ne filtre PAS ces ports ; posé avant tout conteneur à
 #      l'installation, sur confirmation en mode mise à jour
@@ -3100,6 +3100,106 @@ check_restart_policies() {
     fi
 }
 
+ip_to_int() {
+    local IFS=.
+    # shellcheck disable=SC2086
+    set -- $1
+    echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))
+}
+
+ip_in_cidr() {
+    local net="${2%/*}" len="${2#*/}" mask
+    mask=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    [ $(( $(ip_to_int "$1") & mask )) -eq $(( $(ip_to_int "$net") & mask )) ]
+}
+
+# Le Swarm prend ses overlays dans 10.0.0.0/8 (ingress 10.0.0.0/24,
+# dokploy-network 10.0.1.0/24), et le réseau privé Hetzner est souvent
+# 10.0.0.0/16. Un conteneur relié à un overlay route tout ce sous-réseau dans
+# l'overlay : si l'adresse privée du serveur, sa passerelle ou le manager y
+# tombent, il ne les joint plus (Dokploy publié en mode ingress ne pourrait plus
+# piloter ses remotes, par exemple). Mesuré le 07/10/2026 : recouvrement des
+# PLAGES sur les deux serveurs, mais sans conflit réel — l'ingress n'a que son
+# point d'entrée, et aucune adresse utile n'est dans 10.0.1.0/24. On ne signale
+# donc qu'un overlay réellement utilisé par un conteneur local ET contenant une
+# adresse dont l'hôte a besoin ; le seul recouvrement des plages serait du bruit.
+check_overlay_overlap() {
+    [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ] || return 0
+    chk_sect "Réseaux overlay Swarm"
+    local -a addrs=()
+    local a id name subnet used conflicts="" n=0 mgr
+    mgr="$(state_get MANAGER_IP)"
+    # Adresses de l'hôte et passerelles hors Docker, plus l'IP du manager.
+    mapfile -t addrs < <(
+        {
+            ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {sub(/\/.*/, "", $4); print $4}'
+            ip -4 route show 2>/dev/null | awk '{g=""; d=""; for (i = 1; i < NF; i++) {if ($i == "via") g = $(i+1); if ($i == "dev") d = $(i+1)} if (g != "" && d !~ /^(docker|br-|veth)/) print g}'
+            [ -n "$mgr" ] && printf '%s\n' "$mgr"
+        } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u
+    )
+    while read -r id; do
+        [ -n "$id" ] || continue
+        name="$(docker network inspect -f '{{.Name}}' "$id" 2>/dev/null)"
+        # Points d'entrée internes au Swarm (ingress-endpoint, lb-*) exclus :
+        # seuls de vrais conteneurs routent via l'overlay.
+        used="$(docker network inspect -f '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
+            | grep -vE '^(ingress-endpoint|lb-.*)?$')"
+        [ -n "$used" ] || continue
+        for subnet in $(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$id" 2>/dev/null); do
+            [[ "$subnet" =~ ^[0-9.]+/[0-9]+$ ]] || continue   # IPv4 seulement
+            n=$((n+1))
+            for a in "${addrs[@]}"; do
+                ip_in_cidr "$a" "$subnet" && conflicts="${conflicts}${conflicts:+ ; }${name} (${subnet}) contient ${a}"
+            done
+        done
+    done < <(docker network ls --filter driver=overlay -q 2>/dev/null)
+    if [ -n "$conflicts" ]; then
+        chk_fail "Overlay Swarm en conflit avec le réseau de l'hôte, ses conteneurs ne joignent plus ces adresses : ${conflicts}"; fail=$((fail+1))
+    elif [ "$n" -eq 0 ]; then
+        chk_info "Aucun overlay utilisé par un conteneur local"
+    else
+        chk_pass "Aucun overlay utilisé ne contient une adresse de l'hôte, sa passerelle ou le manager (${n} sous-réseau(x))"; pass=$((pass+1))
+    fi
+}
+
+# Un healthcheck n'alerte personne : Docker marque le conteneur « unhealthy »
+# et s'arrête là. Une boucle de redémarrage (nginx sur une conf refusée) ou un
+# `init` en échec laissent de même `check` vert — la politique de redémarrage
+# est bonne, le site est pourtant hors ligne. Aucun cas en cours sur les deux
+# serveurs diagnostiqués le 07/10/2026, mais rien ne l'aurait signalé.
+check_container_health() {
+    command -v docker >/dev/null 2>&1 || return 0
+    chk_sect "Santé des conteneurs"
+    local unhealthy restarting exited failed="" name code policy project n=0
+    unhealthy="$(docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null | paste -sd, - | sed 's/,/, /g')"
+    restarting="$(docker ps --filter status=restarting --format '{{.Names}}' 2>/dev/null | paste -sd, - | sed 's/,/, /g')"
+    # Conteneurs Compose à usage unique (politique « no », ex. `init` du
+    # template WordPress) terminés en erreur : nginx en dépend et ne démarre
+    # pas. Les tâches Swarm arrêtées, qui portent aussi « no », n'ont pas de
+    # label Compose et sont donc ignorées.
+    exited="$(docker ps -aq --filter status=exited 2>/dev/null)"
+    if [ -n "$exited" ]; then
+        # shellcheck disable=SC2086
+        while read -r name code policy project; do
+            [ -n "$project" ] && [ "$project" != "-" ] || continue
+            [ "$policy" = "no" ] && [ "$code" != "0" ] || continue
+            failed="${failed}${failed:+, }${name#/} (code ${code})"
+        done < <(docker inspect --format '{{.Name}} {{.State.ExitCode}} {{or .HostConfig.RestartPolicy.Name "no"}} {{or (index .Config.Labels "com.docker.compose.project") "-"}}' $exited 2>/dev/null)
+    fi
+    if [ -n "$unhealthy" ]; then
+        chk_fail "Conteneur(s) unhealthy : ${unhealthy}"; fail=$((fail+1)); n=1
+    fi
+    if [ -n "$restarting" ]; then
+        chk_fail "Conteneur(s) en boucle de redémarrage : ${restarting}"; fail=$((fail+1)); n=1
+    fi
+    if [ -n "$failed" ]; then
+        chk_fail "Conteneur(s) à usage unique terminé(s) en erreur : ${failed}"; fail=$((fail+1)); n=1
+    fi
+    if [ "$n" -eq 0 ]; then
+        chk_pass "Aucun conteneur unhealthy, en boucle de redémarrage ou terminé en erreur"; pass=$((pass+1))
+    fi
+}
+
 # Anti-bruit, pensé pour un webhook partagé par plusieurs serveurs :
 #   - échecs nouveaux ou différents → UN message, qui notifie ;
 #   - même liste qu'au dernier envoi → rien, rappel au plus tous les 7 jours.
@@ -3859,6 +3959,20 @@ cmd_check() {
     else
         chk_fail "Rotation des logs Docker non configurée (/etc/docker/daemon.json absent ou sans max-size)"; fail=$((fail+1))
     fi
+    if command -v docker >/dev/null 2>&1; then
+        # Valeur EFFECTIVE (docker info), pas celle du fichier : un daemon.json
+        # modifié n'est lu qu'au redémarrage du démon.
+        local pools
+        pools="$(docker info --format '{{range .DefaultAddressPools}}{{.Base}}/{{.Size}} {{end}}' 2>/dev/null)"
+        if [ -n "$pools" ]; then
+            chk_pass "Plages réseau Docker élargies : ${pools% }"; pass=$((pass+1))
+        elif grep -q '"default-address-pools"' /etc/docker/daemon.json 2>/dev/null; then
+            chk_warn "default-address-pools écrit dans daemon.json mais pas actif : redémarrer Docker"
+        else
+            chk_warn "Plages réseau Docker par défaut : une trentaine de réseaux bridge au plus (2 par site WordPress) — relancer init-vps --update"
+        fi
+    fi
+    check_overlay_overlap
 
     chk_sect "Ports publiés par Docker"
     # Publié ne veut pas dire exposé : avec nos règles DOCKER-USER, un port
@@ -3927,6 +4041,7 @@ cmd_check() {
     check_dokploy_remote
     check_container_memory
     check_restart_policies
+    check_container_health
 
     chk_sect "Traefik (HTTP/3 + compression)"
     local tconf="/etc/dokploy/traefik/traefik.yml"
@@ -4054,37 +4169,87 @@ HELPEREOF
 }
 
 ###############################################################################
-# 15. LIMITATION DES LOGS DOCKER
+# 15. DÉMON DOCKER : LOGS ET PLAGES RÉSEAU
 ###############################################################################
+# Deux réglages du démon, FUSIONNÉS dans daemon.json (les autres clés sont
+# conservées — l'ancienne version réécrivait le fichier entier) :
+#   - rotation des logs : 10 Mo x 3 par conteneur ;
+#   - default-address-pools : Docker n'a par défaut qu'une trentaine de
+#     sous-réseaux bridge (172.17–31 en /16, 192.168 en /20), et chaque site
+#     WordPress Dokploy en consomme deux (default + backend). Mesuré le
+#     07/10/2026 : ~9 sites de marge sur un serveur client. En /24 dans
+#     172.16.0.0/12 : ~500 réseaux de plus, sans toucher au 10.0.0.0/8 du
+#     réseau privé Hetzner ni du Swarm. Docker évite seul les routes de l'hôte
+#     (il a sauté 172.31.0.0/16, qui contient la passerelle Hetzner
+#     172.31.1.1) ; les réseaux existants gardent leur plage.
+# Une clé déjà présente n'est jamais modifiée.
 step_docker_log_limits() {
-    log_step "Limitation des logs Docker"
+    log_step "Configuration du démon Docker (logs, plages réseau)"
     mkdir -p /etc/docker
 
-    local needs_restart=0
-    if [[ ! -f /etc/docker/daemon.json ]] || ! grep -q '"max-size"' /etc/docker/daemon.json 2>/dev/null; then
-        backup_file /etc/docker/daemon.json
-        cat > /etc/docker/daemon.json <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOF
-        needs_restart=1
-    fi
-
-    if [[ "$needs_restart" -eq 0 ]]; then
-        log_info "Limitation des logs Docker déjà en place."
+    if ! command -v python3 &>/dev/null; then
+        log_warn "python3 absent : /etc/docker/daemon.json non vérifié."
         return
     fi
 
+    local f=/etc/docker/daemon.json tmp changes rc
+    tmp="$(mktemp /etc/docker/.daemon.json.XXXXXX)"
+    changes="$(python3 - "$f" "$tmp" <<'PY'
+import json, os, sys
+src, dst = sys.argv[1], sys.argv[2]
+d = {}
+if os.path.exists(src) and os.path.getsize(src) > 0:
+    try:
+        with open(src) as fh:
+            d = json.load(fh)
+    except ValueError:
+        sys.exit(3)
+if not isinstance(d, dict):
+    sys.exit(3)
+changes = []
+if "max-size" not in (d.get("log-opts") or {}):
+    d["log-driver"] = "json-file"
+    d["log-opts"] = {"max-size": "10m", "max-file": "3"}
+    changes.append("logs 10 Mo x 3")
+if "default-address-pools" not in d:
+    d["default-address-pools"] = [{"base": "172.16.0.0/12", "size": 24}]
+    changes.append("plages réseau 172.16.0.0/12 en /24")
+if changes:
+    with open(dst, "w") as fh:
+        json.dump(d, fh, indent=2)
+        fh.write("\n")
+print(", ".join(changes))
+PY
+)"
+    rc=$?
+
+    if [[ "$rc" -eq 3 ]]; then
+        rm -f "$tmp"
+        log_warn "/etc/docker/daemon.json n'est pas un JSON valide : laissé tel quel, à corriger à la main."
+        return
+    fi
+    if [[ "$rc" -ne 0 || -z "$changes" ]]; then
+        rm -f "$tmp"
+        if [[ "$rc" -ne 0 ]]; then
+            log_warn "Lecture de /etc/docker/daemon.json impossible (python3 code $rc)."
+        else
+            log_info "Configuration du démon Docker déjà en place."
+        fi
+        return
+    fi
+
+    backup_file "$f"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$f"
+
     if command -v docker &>/dev/null; then
+        # Sans live-restore (incompatible avec Swarm), redémarrer le démon
+        # redémarre tous les conteneurs : environ une minute d'interruption.
+        log_warn "Redémarrage de Docker pour appliquer (${changes}) : tous les conteneurs redémarrent."
         systemctl restart docker
-        log_ok "Logs Docker limités à 10 Mo x 3 fichiers par conteneur (Docker redémarré pour appliquer)."
+        log_ok "daemon.json mis à jour (${changes}), Docker redémarré."
     else
-        log_ok "Logs Docker limités à 10 Mo x 3 fichiers par conteneur (sera appliqué dès l'installation de Docker)."
+        log_ok "daemon.json mis à jour (${changes}), appliqué dès l'installation de Docker."
     fi
 }
 
