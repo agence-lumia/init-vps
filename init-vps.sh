@@ -1560,7 +1560,7 @@ step_swap() {
     # Détecte tout swap déjà actif (swapfile OU partition fournie par le provider)
     # pour ne pas empiler un swapfile inutile par-dessus.
     if grep -q . <<< "$(swapon --show --noheadings 2>/dev/null)"; then
-        log_warn "Un swap est déjà actif sur ce serveur, étape ignorée."
+        log_info "Swap déjà actif ($(free -h | awk '/^Swap:/ {print $2}')), création ignorée."
         return
     fi
 
