@@ -484,7 +484,7 @@ collect_swap() {
     # Même test que step_swap : tout swap actif, pas seulement /swapfile. Un
     # provider qui fournit une PARTITION de swap ne matchait pas ce motif, et
     # le script demandait une taille... que step_swap ignorait ensuite.
-    if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    if grep -q . <<< "$(swapon --show --noheadings 2>/dev/null)"; then
         log_info "Un swap est déjà actif sur ce serveur ($(free -h | awk '/^Swap:/ {print $2}')), cette étape sera ignorée."
         SWAP_SIZE_GB=0
         return
@@ -573,7 +573,7 @@ detect_private_addr() {
 # Vide, ou une IPv4 réellement portée par ce serveur.
 validate_local_ipv4() {
     [[ -z "$1" ]] && return 0
-    is_valid_ipv4 "$1" && ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$1"
+    is_valid_ipv4 "$1" && grep -qxF "$1" <<< "$(ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}')"
 }
 
 # Rôle remote : adresse d'annonce du swarm. Dokploy l'initialiserait sinon avec
@@ -919,7 +919,7 @@ ssh_port_directives() {
 }
 
 ssh_listening_on() {
-    ss -Hltn "( sport = :${1} )" 2>/dev/null | grep -q .
+    grep -q . <<< "$(ss -Hltn "( sport = :${1} )" 2>/dev/null)"
 }
 
 # Commande de test à afficher, avec -p seulement si le port n'est pas 22.
@@ -1203,7 +1203,7 @@ step_ufw_base() {
     # Nettoyage des éventuelles anciennes règles sur le port 3000 (évite les
     # doublons/conflits si le script est relancé avec une restriction IP différente).
     local attempts=0 rule_num
-    while ufw status numbered | grep -q '3000/tcp' && (( attempts < 10 )); do
+    while grep -q '3000/tcp' <<< "$(ufw status numbered)" && (( attempts < 10 )); do
         rule_num=$(ufw status numbered | grep '3000/tcp' | head -n1 | grep -oP '^\[\s*\K[0-9]+' || true)
         [[ -z "$rule_num" ]] && break
         yes | ufw delete "$rule_num" >/dev/null 2>&1 || true
@@ -1550,7 +1550,7 @@ sysctl_verify() {
 step_swap() {
     log_step "Création du swap"
     if [[ "$SWAP_SIZE_GB" -eq 0 ]]; then
-        if swapon --show --noheadings 2>/dev/null | grep -q .; then
+        if grep -q . <<< "$(swapon --show --noheadings 2>/dev/null)"; then
             log_info "Swap déjà actif ($(free -h | awk '/^Swap:/ {print $2}')), création ignorée."
         else
             log_info "Aucun swap demandé (0 Go), création ignorée."
@@ -1559,7 +1559,7 @@ step_swap() {
     fi
     # Détecte tout swap déjà actif (swapfile OU partition fournie par le provider)
     # pour ne pas empiler un swapfile inutile par-dessus.
-    if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    if grep -q . <<< "$(swapon --show --noheadings 2>/dev/null)"; then
         log_warn "Un swap est déjà actif sur ce serveur, étape ignorée."
         return
     fi
@@ -1950,7 +1950,7 @@ cmd_whitelist() {
     local jail_file="/etc/fail2ban/jail.local"
     [[ -f "$jail_file" ]] || { err "Fichier ${jail_file} introuvable."; exit 1; }
 
-    if grep "^ignoreip" "$jail_file" 2>/dev/null | grep -qw "$ip"; then
+    if grep -qw "$ip" <<< "$(grep "^ignoreip" "$jail_file" 2>/dev/null)"; then
         info "${ip} est déjà dans la liste blanche fail2ban."
         return
     fi
@@ -2115,7 +2115,7 @@ cmd_ssh_keys() {
 
 cmd_close_dokploy() {
     local attempts=0 rule_num found=0
-    while ufw status numbered | grep -q '3000/tcp' && (( attempts < 10 )); do
+    while grep -q '3000/tcp' <<< "$(ufw status numbered)" && (( attempts < 10 )); do
         rule_num=$(ufw status numbered | grep '3000/tcp' | head -n1 | grep -oP '^\[\s*\K[0-9]+' || true)
         [[ -z "$rule_num" ]] && break
         yes | ufw delete "$rule_num" >/dev/null 2>&1 || true
@@ -2128,7 +2128,7 @@ cmd_close_dokploy() {
     if [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]]; then
         rm -f "$DOCKER_USER_DOKPLOY_FILE"
         found=1
-        if [ -x "$DOCKER_USER_APPLY" ] && docker_user_rules | grep -q -- '--comment init-vps'; then
+        if [ -x "$DOCKER_USER_APPLY" ] && grep -q -- '--comment init-vps' <<< "$(docker_user_rules)"; then
             "$DOCKER_USER_APPLY" || warn "Réapplication des règles DOCKER-USER en échec : vps-helper docker-firewall status"
         fi
     fi
@@ -2448,8 +2448,11 @@ FRAGEOF
     # personnalisée → on n'y touche pas.
     if [[ "$(yq '.http.middlewares.compression.compress.includedContentTypes // [] | length' "$mconf")" != "0" ]]; then
         info "Compression en liste blanche (includedContentTypes) — exclusion SSE non gérée."
-    elif ! yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf" \
-            | grep -qx 'text/event-stream'; then
+    # Sortie capturée, jamais `yq … | grep -q` : grep -q quitte à la première
+    # correspondance, yq prend SIGPIPE (141) et, sous pipefail, le test échoue
+    # alors que la valeur est présente (mesuré en prod : 6 échecs sur 30).
+    elif ! grep -qx 'text/event-stream' \
+            <<< "$(yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf")"; then
         [[ -f "${mconf}.bak-${stamp}" ]] || cp -a "$mconf" "${mconf}.bak-${stamp}"
         yq -i '.http.middlewares.compression.compress.excludedContentTypes = ["text/event-stream"] + (.http.middlewares.compression.compress.excludedContentTypes // [])' "$mconf"
         changed=1
@@ -2462,7 +2465,7 @@ FRAGEOF
     # uniquement si un patch est réellement nécessaire.
     local tconf_needs_patch=0
     [[ "$(yq '.entryPoints.websecure.http3.advertisedPort // "null"' "$tconf")" == "null" ]] && tconf_needs_patch=1
-    if ! yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" | grep -qx 'compression@file'; then
+    if ! grep -qx 'compression@file' <<< "$(yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf")"; then
         tconf_needs_patch=1
     fi
     [[ "$tconf_needs_patch" -eq 1 ]] && cp -a "$tconf" "${tconf}.bak-${stamp}"
@@ -2477,8 +2480,8 @@ FRAGEOF
     fi
 
     # --- 3. traefik.yml : attacher compression@file en middleware global websecure ---
-    if ! yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" \
-            | grep -qx 'compression@file'; then
+    if ! grep -qx 'compression@file' \
+            <<< "$(yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf")"; then
         yq -i '.entryPoints.websecure.http.middlewares += ["compression@file"]' "$tconf"
         changed=1
         ok "Middleware compression@file attaché à websecure."
@@ -2489,8 +2492,10 @@ FRAGEOF
     # HTTP/3 = QUIC sur UDP/443 : s'assurer que le pare-feu laisse passer l'UDP
     # (utile si cette commande est lancée sur un serveur provisionné avant l'ajout
     # de la règle UDP/443 dans step_ufw_base). ufw allow est idempotent.
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-        if ! ufw status 2>/dev/null | grep -qE '443/udp'; then
+    local ufw_st
+    if command -v ufw >/dev/null 2>&1 && ufw_st="$(ufw status 2>/dev/null)" \
+            && grep -q 'Status: active' <<< "$ufw_st"; then
+        if ! grep -qE '443/udp' <<< "$ufw_st"; then
             ufw allow 443/udp comment 'HTTP/3 QUIC' >/dev/null 2>&1 \
                 && ok "Port UDP/443 ouvert dans UFW (QUIC/HTTP-3)." \
                 || warn "Impossible d'ouvrir UDP/443 dans UFW — à vérifier manuellement."
@@ -2504,13 +2509,13 @@ FRAGEOF
     # (docker service), soit comme conteneur classique (docker run). On gère
     # les deux : service d'abord, puis conteneur nommé dokploy-traefik.
     if [[ "$changed" -eq 1 ]]; then
-        if docker service ls --format '{{.Name}}' 2>/dev/null | grep -q '^dokploy-traefik$'; then
+        if grep -q '^dokploy-traefik$' <<< "$(docker service ls --format '{{.Name}}' 2>/dev/null)"; then
             if docker service update --force dokploy-traefik >/dev/null 2>&1; then
                 ok "Service Traefik rechargé (config statique appliquée)."
             else
                 warn "Rechargement Traefik échoué — relance : docker service update --force dokploy-traefik"
             fi
-        elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^dokploy-traefik$'; then
+        elif grep -q '^dokploy-traefik$' <<< "$(docker ps --format '{{.Names}}' 2>/dev/null)"; then
             if docker restart dokploy-traefik >/dev/null 2>&1; then
                 ok "Conteneur Traefik redémarré (config statique appliquée)."
             else
@@ -2646,7 +2651,7 @@ cmd_docker_firewall() {
                 err "${DOCKER_USER_APPLY} introuvable — relancer init-vps.sh (mode mise à jour) pour l'installer."
                 exit 1
             fi
-            if ! docker_user_chain_is_empty && ! docker_user_rules | grep -q -- '--comment init-vps'; then
+            if ! docker_user_chain_is_empty && ! grep -q -- '--comment init-vps' <<< "$(docker_user_rules)"; then
                 err "La chaîne DOCKER-USER contient des règles qui ne viennent pas d'init-vps — application refusée pour ne pas les écraser."
                 docker_user_rules | sed 's/^/    /'
                 exit 1
@@ -3720,7 +3725,7 @@ check_dokploy_remote() {
     # serveur recréé) et le nœud reste annoncé sur une adresse morte — mesuré.
     if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
         node="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)"
-        if ! ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$node"; then
+        if ! grep -qxF "$node" <<< "$(ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}')"; then
             chk_fail "Swarm annoncé sur ${node}, adresse absente de ce serveur (IP publique changée ?) — réinitialiser le swarm sur l'IP privée (voir CLAUDE.md)"; fail=$((fail+1))
         elif [[ "$node" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
             chk_pass "Swarm annoncé sur l'IP privée ${node}"; pass=$((pass+1))
@@ -3772,7 +3777,7 @@ check_dokploy_remote() {
     sshd_cfg="$(sshd -T 2>/dev/null)"
     allow="$(awk '$1 == "allowusers" {print $2}' <<< "$sshd_cfg")"
     if grep -qxF "${DOKPLOY_USER}@${ip}" <<< "$allow" \
-            && ! grep -v -xF "${DOKPLOY_USER}@${ip}" <<< "$allow" | grep -q "^${DOKPLOY_USER}\(@\|$\)"; then
+            && ! grep -q "^${DOKPLOY_USER}\(@\|$\)" <<< "$(grep -v -xF "${DOKPLOY_USER}@${ip}" <<< "$allow")"; then
         chk_pass "AllowUsers : ${DOKPLOY_USER}@${ip} uniquement pour ${DOKPLOY_USER}"; pass=$((pass+1))
     else
         chk_fail "AllowUsers non conforme (attendu : ${DOKPLOY_USER}@${ip}) — corriger : sudo vps-helper manager --ip ${ip}"; fail=$((fail+1))
@@ -3816,7 +3821,7 @@ cmd_check() {
     fi
 
     chk_sect "UFW"
-    if ufw status 2>/dev/null | grep -q 'Status: active'; then
+    if grep -q 'Status: active' <<< "$(ufw status 2>/dev/null)"; then
         chk_pass "UFW actif"; pass=$((pass+1))
     else
         chk_fail "UFW inactif"; fail=$((fail+1))
@@ -3864,7 +3869,7 @@ cmd_check() {
         filtering=unknown
     elif docker_user_chain_is_empty; then
         filtering=none
-    elif docker_user_rules | grep -q -- '--comment init-vps'; then
+    elif grep -q -- '--comment init-vps' <<< "$(docker_user_rules)"; then
         filtering=ours
     else
         filtering=foreign
@@ -3906,7 +3911,7 @@ cmd_check() {
         local n6 docker_v6=0
         n6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c '^-A' || true)
         # shellcheck disable=SC2046  # un ID de réseau par argument, découpage voulu
-        if docker network inspect $(docker network ls -q 2>/dev/null) --format '{{.EnableIPv6}}' 2>/dev/null | grep -q true \
+        if grep -q true <<< "$(docker network inspect $(docker network ls -q 2>/dev/null) --format '{{.EnableIPv6}}' 2>/dev/null)" \
                 || grep -qE '"ipv6"[[:space:]]*:[[:space:]]*true' /etc/docker/daemon.json 2>/dev/null; then
             docker_v6=1
         fi
@@ -3935,8 +3940,8 @@ cmd_check() {
         else
             chk_fail "HTTP/3 non activé (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
         fi
-        if yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" 2>/dev/null \
-                | grep -qx 'compression@file'; then
+        if grep -qx 'compression@file' \
+                <<< "$(yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" 2>/dev/null)"; then
             chk_pass "Middleware compression attaché à websecure"; pass=$((pass+1))
         else
             chk_fail "Compression non attachée (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
@@ -3946,8 +3951,8 @@ cmd_check() {
             :
         elif [[ "$(yq '.http.middlewares.compression.compress.includedContentTypes // [] | length' "$mconf" 2>/dev/null)" != "0" ]]; then
             chk_info "Compression en liste blanche (includedContentTypes) — SSE non vérifié"
-        elif yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf" 2>/dev/null \
-                | grep -qx 'text/event-stream'; then
+        elif grep -qx 'text/event-stream' \
+                <<< "$(yq '.http.middlewares.compression.compress.excludedContentTypes // [] | .[]' "$mconf" 2>/dev/null)"; then
             chk_pass "Flux SSE (text/event-stream) exclus de la compression"; pass=$((pass+1))
         else
             chk_fail "Flux SSE compressés : MCP/streaming bloqués (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
@@ -3966,7 +3971,7 @@ cmd_check() {
 
     chk_sect "Informations (non bloquantes)"
     chk_info "Port SSH : $(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | paste -sd' ')"
-    if swapon --show 2>/dev/null | grep -q '/swapfile'; then
+    if grep -q '/swapfile' <<< "$(swapon --show 2>/dev/null)"; then
         chk_info "Swap : présent"
     else
         chk_info "Swap : absent"
@@ -3975,7 +3980,7 @@ cmd_check() {
     # seule ne dit rien, UFW ne voit pas ce trafic.
     if [ -f "$DOCKER_USER_DOKPLOY_FILE" ]; then
         chk_info "Port 3000 : ouvert (à fermer après configuration du domaine : vps-helper close-dokploy)"
-    elif ufw status numbered 2>/dev/null | grep -q '3000/tcp'; then
+    elif grep -q '3000/tcp' <<< "$(ufw status numbered 2>/dev/null)"; then
         chk_info "Port 3000 : règle UFW résiduelle, sans effet sur un port Docker (nettoyer : vps-helper close-dokploy)"
     else
         chk_info "Port 3000 : fermé"
@@ -4242,7 +4247,10 @@ IFACE6="$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) 
 [ -n "$IFACE6" ] || exit 0
 
 # Même règle qu'en IPv4 : des règles tierces ne sont jamais écrasées.
-if ip6tables -S DOCKER-USER 2>/dev/null | grep '^-A' | grep -qv -- '--comment init-vps'; then
+# Capturé : `… | grep -qv` peut échouer par SIGPIPE sous pipefail. Le test -n
+# évite qu'une chaîne vide (une ligne vide pour <<<) passe pour une règle tierce.
+v6_rules="$(ip6tables -S DOCKER-USER 2>/dev/null | grep '^-A' || true)"
+if [ -n "$v6_rules" ] && grep -qv -- '--comment init-vps' <<< "$v6_rules"; then
     echo "docker-user: règles IPv6 tierces dans DOCKER-USER — miroir IPv6 non appliqué." >&2
     exit 0
 fi
@@ -4343,7 +4351,7 @@ UNITEOF
     # règles maintenant : les conteneurs installés juste après (Dokploy,
     # Traefik) naissent déjà derrière le filtre, sans fenêtre d'exposition.
     if systemctl list-unit-files docker.service >/dev/null 2>&1 \
-        && systemctl list-unit-files docker.service 2>/dev/null | grep -q '^docker\.service'; then
+        && grep -q '^docker\.service' <<< "$(systemctl list-unit-files docker.service 2>/dev/null)"; then
         # `restart` et non `start` : avec RemainAfterExit, une unit déjà
         # active ne rejouerait pas le script et les règles ne seraient pas
         # rafraîchies.
@@ -5042,8 +5050,8 @@ dokploy_has_tls_domain() {
 #   sauf si l'accès au panneau est ouvert (fichier dokploy-ui), ou si la
 #   chaîne est vide (rien ne filtre).
 dokploy_port_is_open() {
-    ufw status 2>/dev/null | grep -q '3000/tcp' && return 0
-    docker_published_public_ports 2>/dev/null | grep -qx '3000/tcp' || return 1
+    grep -q '3000/tcp' <<< "$(ufw status 2>/dev/null)" && return 0
+    grep -qx '3000/tcp' <<< "$(docker_published_public_ports 2>/dev/null)" || return 1
     [[ -f "$DOCKER_USER_DOKPLOY_FILE" ]] && return 0
     command -v iptables &>/dev/null && docker_user_chain_is_empty
 }
