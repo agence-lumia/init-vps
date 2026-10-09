@@ -107,6 +107,7 @@ SSH_PORT=22
 NOTIFY_ENABLED=""
 AUTO_REBOOT=""
 AUTO_REBOOT_TIME="04:00"
+CROWDSEC_ENABLED=""
 # Secret saisi pendant la collecte : en mémoire uniquement, écrit dans son
 # fichier 600 par step_notify, jamais dans $STATE_FILE.
 NOTIFY_WEBHOOK_URL=""
@@ -647,6 +648,17 @@ collect_auto_reboot() {
     prompt AUTO_REBOOT_TIME "Heure de la fenêtre (HH:MM)" "${AUTO_REBOOT_TIME:-04:00}" validate_hhmm
 }
 
+collect_crowdsec() {
+    log_step "CrowdSec (recommandé)"
+    log_info "Lit les logs des conteneurs nginx (sites WordPress du template) et bannit les scanners et attaques par force brute, plus la liste communautaire d'IP malveillantes. fail2ban, lui, ne protège que SSH : ses bans ne s'appliquent pas au trafic web, qui passe par Docker."
+    log_info "Démarre en SIMULATION : rien n'est bloqué, « vps-helper crowdsec status » montre ce qui l'aurait été. Activer ensuite : sudo vps-helper crowdsec enforce"
+    if confirm "Installer CrowdSec ?" "o"; then
+        CROWDSEC_ENABLED="1"
+    else
+        CROWDSEC_ENABLED="0"
+    fi
+}
+
 show_recap() {
     log_step "Récapitulatif avant exécution"
     local swap_line dokploy_line advertise_line role_line
@@ -679,6 +691,9 @@ show_recap() {
         fi
         if [[ "$AUTO_REBOOT" == "1" ]]; then
             echo "  Redémarrage automatique   : si requis, vers ${AUTO_REBOOT_TIME}"
+        fi
+        if [[ "$CROWDSEC_ENABLED" == "1" ]]; then
+            echo "  CrowdSec                  : oui (démarre en simulation)"
         fi
     }
     echo ""
@@ -1882,7 +1897,7 @@ iv_update_available() {
     iv_version_gt "$latest" "$INIT_VPS_VERSION"
 }
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall notify-test notify-set reboot-auto reboot-skip reboot-status self-update manager"
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall crowdsec notify-test notify-set reboot-auto reboot-skip reboot-status self-update manager"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -1915,6 +1930,11 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
                                  Filtrage des ports publiés par Docker (DOCKER-USER)
                                  status : état et ports exposés · apply : (re)poser
                                  les règles · clear : les retirer
+  ${C_CYAN}vps-helper crowdsec [action]${C_RESET}
+                                 CrowdSec (attaques web) · status : mode, alertes,
+                                 bans · enforce / simulate : bloquer ou seulement
+                                 compter · allow <IP|CIDR> : liste blanche ·
+                                 unban <IP> : lever un ban
   ${C_CYAN}vps-helper notify-set${C_RESET}          Poser ou changer l'URL du webhook (puis envoi de test)
   ${C_CYAN}vps-helper notify-test [fail]${C_RESET}  Notification de test (fail : alerte qui notifie)
   ${C_CYAN}vps-helper reboot-status${C_RESET}       Redémarrage requis / planifié
@@ -2151,6 +2171,51 @@ cmd_close_dokploy() {
             echo 'DOKPLOY_PORT_CLOSED="1"' >> "$state_file"
         fi
     fi
+}
+
+cmd_crowdsec() {
+    local action="${1:-status}" target="${2:-}" mode
+    command -v cscli >/dev/null 2>&1 || { err "CrowdSec n'est pas installé (option CrowdSec de init-vps, puis --update)."; exit 1; }
+    case "$action" in
+        status)
+            mode="$(crowdsec_mode)"
+            printf '%b\n' "${C_BOLD}CrowdSec${C_RESET}"
+            info "Mode       : ${mode:-non branché} (simulation = rien n'est bloqué, compteur seulement)"
+            info "Services   : crowdsec $(systemctl is-active crowdsec 2>/dev/null), bouncer $(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null)"
+            info "Liste      : $(crowdsec_set_size || echo '?') IP (bans locaux + liste communautaire)"
+            info "DOCKER-USER: $(crowdsec_rule_packets || echo 0) paquet(s) $([ "$mode" = enforce ] && echo bloqués || echo 'qui auraient été bloqués')"
+            printf '\n%b\n' "${C_BOLD}Alertes des dernières 24 h${C_RESET}"
+            cscli alerts list --since 24h -l 20 2>/dev/null || true
+            printf '\n%b\n' "${C_BOLD}Bans locaux en cours${C_RESET} (hors liste communautaire)"
+            cscli decisions list -l 20 2>/dev/null || true
+            ;;
+        enforce|simulate)
+            mode="enforce"; [ "$action" = simulate ] && mode="simulation"
+            echo "$mode" > "$CROWDSEC_MODE_FILE"
+            chmod 644 "$CROWDSEC_MODE_FILE"
+            if [ -x "$DOCKER_USER_APPLY" ] && grep -q -- '--comment init-vps' <<< "$(docker_user_rules)"; then
+                "$DOCKER_USER_APPLY" || { err "Réapplication de DOCKER-USER en échec : vps-helper docker-firewall status"; exit 1; }
+                ok "CrowdSec en mode « ${mode} »."
+            else
+                warn "Mode « ${mode} » enregistré, mais DOCKER-USER ne porte pas nos règles : rien n'est branché (vps-helper docker-firewall apply)."
+            fi
+            ;;
+        allow)
+            [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
+                || { err "Usage : vps-helper crowdsec allow <IP|CIDR> (IPv4)"; exit 1; }
+            cscli allowlists add init-vps "$target" >/dev/null 2>&1 || true
+            cscli decisions delete --ip "${target%/*}" >/dev/null 2>&1 || true
+            ok "${target} ajoutée à la liste blanche CrowdSec (jamais bannie), ban éventuel levé."
+            ;;
+        unban)
+            [[ "$target" =~ ^[0-9a-fA-F.:]+$ ]] || { err "Usage : vps-helper crowdsec unban <IP>"; exit 1; }
+            cscli decisions delete --ip "$target" 2>&1 | tail -n 1
+            ;;
+        *)
+            err "Usage : vps-helper crowdsec [status|enforce|simulate|allow <IP|CIDR>|unban <IP>]"
+            exit 1
+            ;;
+    esac
 }
 
 cmd_restart() {
@@ -2536,6 +2601,27 @@ FRAGEOF
 DOCKER_USER_APPLY=/usr/local/lib/docker-user/apply.sh
 # Présent = accès au panneau Dokploy (3000/tcp) laissé passer par apply.sh.
 DOCKER_USER_DOKPLOY_FILE=/usr/local/lib/docker-user/dokploy-ui
+# Mode CrowdSec lu par apply.sh : « simulation » (compteur) ou « enforce » (DROP).
+CROWDSEC_MODE_FILE=/usr/local/lib/docker-user/crowdsec
+
+crowdsec_mode() {
+    [ -r "$CROWDSEC_MODE_FILE" ] && head -n 1 "$CROWDSEC_MODE_FILE" | tr -d '[:space:]'
+}
+
+# Nombre d'entrées de l'ensemble IPv4 (IP bannies, locales + liste communautaire).
+crowdsec_set_size() {
+    local out
+    out="$(ipset list crowdsec-blacklists 2>/dev/null)"
+    awk '/^Number of entries:/ {print $4}' <<< "$out"
+}
+
+# Paquets passés par la règle de l'ensemble dans DOCKER-USER : bloqués en
+# enforce, « auraient été bloqués » en simulation. Capturé d'abord (pipefail).
+crowdsec_rule_packets() {
+    local out
+    out="$(iptables -L DOCKER-USER -v -n -x 2>/dev/null)"
+    awk '/match-set crowdsec-blacklists src/ && !f {print $1; f=1}' <<< "$out"
+}
 
 # Un « port/proto » par ligne, dédoublonné. `done < <(...)` et non un pipe :
 # la boucle doit tourner dans le shell courant.
@@ -3097,6 +3183,34 @@ check_restart_policies() {
         chk_warn "Sans politique de redémarrage, ne reviendront pas après un reboot : ${list}"
     else
         chk_pass "Tous les conteneurs reviennent seuls après un reboot (Swarm ou politique de redémarrage)"; pass=$((pass+1))
+    fi
+}
+
+# Activé (config.env) ou simplement installé : sinon, rien à vérifier.
+check_crowdsec() {
+    [ "$(state_get CROWDSEC_ENABLED)" = "1" ] || command -v cscli >/dev/null 2>&1 || return 0
+    chk_sect "CrowdSec"
+    if ! command -v cscli >/dev/null 2>&1; then
+        chk_fail "CrowdSec activé dans config.env mais non installé : relancer init-vps --update"; fail=$((fail+1))
+        return
+    fi
+    local svc down="" mode size pkts rules
+    for svc in crowdsec crowdsec-firewall-bouncer; do
+        systemctl is-active --quiet "$svc" || down="${down}${down:+, }${svc}"
+    done
+    if [ -n "$down" ]; then
+        chk_fail "Service(s) CrowdSec arrêté(s) : ${down}"; fail=$((fail+1))
+    fi
+    rules="$(iptables -S DOCKER-USER 2>/dev/null)"
+    if ! grep -q 'match-set crowdsec-blacklists' <<< "$rules"; then
+        chk_fail "Ensemble CrowdSec non branché dans DOCKER-USER : rien n'est bloqué (vps-helper docker-firewall apply)"; fail=$((fail+1))
+        return
+    fi
+    mode="$(crowdsec_mode)"; size="$(crowdsec_set_size)"; pkts="$(crowdsec_rule_packets)"
+    if [ "$mode" = "enforce" ]; then
+        [ -z "$down" ] && { chk_pass "CrowdSec bloque : ${size:-0} IP dans la liste, ${pkts:-0} paquet(s) rejeté(s) depuis le dernier chargement des règles"; pass=$((pass+1)); }
+    else
+        chk_info "CrowdSec en simulation : ${size:-0} IP dans la liste, ${pkts:-0} paquet(s) auraient été bloqués — détail : vps-helper crowdsec status, activer : vps-helper crowdsec enforce"
     fi
 }
 
@@ -4042,6 +4156,7 @@ cmd_check() {
     check_container_memory
     check_restart_policies
     check_container_health
+    check_crowdsec
 
     chk_sect "Traefik (HTTP/3 + compression)"
     local tconf="/etc/dokploy/traefik/traefik.yml"
@@ -4145,6 +4260,7 @@ case "$CMD" in
     check)          shift; cmd_check "$@" ;;
     traefik-tuning) cmd_traefik_tuning ;;
     docker-firewall) shift; cmd_docker_firewall "$@" ;;
+    crowdsec)       shift; cmd_crowdsec "$@" ;;
     notify-test)    shift; cmd_notify_test "$@" ;;
     notify-set)     cmd_notify_set ;;
     reboot-auto)    shift; cmd_reboot_auto "$@" ;;
@@ -4364,6 +4480,34 @@ COMMENT=(-m comment --comment init-vps)
 iptables -N DOCKER-USER 2>/dev/null || true
 iptables -F DOCKER-USER
 
+# CrowdSec (vps-helper crowdsec) : le bouncer, en mode ipset, ne pose AUCUNE
+# règle — il remplit seulement ces ensembles. C'est ici qu'on les branche, en
+# TÊTE de chaîne (avant ESTABLISHED : un ban coupe aussi les connexions en
+# cours). « simulation » = règle sans cible, simple compteur de ce qui aurait
+# été bloqué ; « enforce » = DROP. Paramètres de création identiques à ceux du
+# drop-in du bouncer (step_crowdsec) : un `-exist` sur des paramètres
+# différents échoue.
+CROWDSEC_FILE=/usr/local/lib/docker-user/crowdsec
+CROWDSEC_MODE=""
+if [ -r "$CROWDSEC_FILE" ]; then
+    CROWDSEC_MODE="$(head -n 1 "$CROWDSEC_FILE" | tr -d '[:space:]')"
+fi
+crowdsec_rule() {   # $1 = iptables|ip6tables, $2 = nom de l'ensemble, $3 = famille
+    command -v ipset >/dev/null 2>&1 || return 0
+    ipset create "$2" hash:net family "$3" timeout 0 maxelem 262144 -exist 2>/dev/null || true
+    if ! ipset list -n "$2" >/dev/null 2>&1; then
+        echo "docker-user: ensemble ${2} absent — règle CrowdSec non posée." >&2
+        return 0
+    fi
+    case "$CROWDSEC_MODE" in
+        enforce)    "$1" -A DOCKER-USER -m set --match-set "$2" src "${COMMENT[@]}" -j DROP ;;
+        simulation) "$1" -A DOCKER-USER -m set --match-set "$2" src "${COMMENT[@]}" ;;
+        "")         ;;
+        *)          echo "docker-user: mode CrowdSec inconnu (« ${CROWDSEC_MODE} ») — règle non posée." >&2 ;;
+    esac
+}
+crowdsec_rule iptables crowdsec-blacklists inet
+
 # Réponses aux connexions sortantes des conteneurs.
 iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED "${COMMENT[@]}" -j RETURN
 
@@ -4422,6 +4566,7 @@ fi
 
 ip6tables -N DOCKER-USER 2>/dev/null || true
 ip6tables -F DOCKER-USER
+crowdsec_rule ip6tables crowdsec6-blacklists inet6
 ip6tables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED "${COMMENT[@]}" -j RETURN
 ip6tables -A DOCKER-USER -i "$IFACE6" -p tcp --dport 80 "${COMMENT[@]}" -j RETURN
 ip6tables -A DOCKER-USER -i "$IFACE6" -p tcp --dport 443 "${COMMENT[@]}" -j RETURN
@@ -4735,6 +4880,147 @@ step_dokploy_remote() {
     [[ -n "$DOKPLOY_MANAGER_KEY" ]] && args+=(--key "$DOKPLOY_MANAGER_KEY")
     /usr/local/bin/vps-helper manager "${args[@]}" \
         || log_warn "Accès du manager incomplet (voir les messages ci-dessus) — corriger puis : sudo vps-helper manager --ip ${MANAGER_IP} --key \"<clé>\""
+}
+
+###############################################################################
+# 19b. CROWDSEC — détection et blocage des attaques web
+###############################################################################
+# fail2ban bannit dans la chaîne INPUT : le trafic web, qui passe par Docker
+# (FORWARD, DOCKER-USER), lui échappe. CrowdSec lit les logs des conteneurs
+# nginx du template WordPress (source docker, lignes nouvelles seulement) et
+# remplit un ipset ; apply.sh branche cet ipset en tête de DOCKER-USER.
+#
+# - Bouncer en mode ipset : il ne pose aucune règle (code source vérifié,
+#   v0.0.36), il ne fait que remplir l'ensemble — qui doit donc exister avec
+#   le support des timeouts avant son démarrage (drop-in ExecStartPre).
+#   apply.sh garde ainsi la main sur DOCKER-USER, sans règle tierce.
+# - Dépôt packagecloud : pas encore de « resolute » (26.04) ; repli sur
+#   « noble », comme ensure_docker. Le paquet d'Ubuntu (1.4.6) est trop ancien
+#   et n'a pas de bouncer.
+# - Mode « simulation » au premier passage, jamais réécrit ensuite :
+#   vps-helper crowdsec enforce|simulate.
+CROWDSEC_MODE_FILE="${DOCKER_USER_DIR}/crowdsec"
+CROWDSEC_BOUNCER_LOCAL=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
+CROWDSEC_BOUNCER_DROPIN=/etc/systemd/system/crowdsec-firewall-bouncer.service.d/init-vps.conf
+CROWDSEC_ACQUIS=/etc/crowdsec/acquis.d/init-vps-nginx.yaml
+CROWDSEC_COLLECTIONS=(crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve crowdsecurity/wordpress)
+
+# Écrit $2 dans $1 seulement si le contenu change (temporaire + mv). Code 0 =
+# fichier modifié.
+crowdsec_write_if_changed() {
+    local target="$1" content="$2" tmp
+    [[ -f "$target" ]] && [[ "$(cat "$target")" == "$content" ]] && return 1
+    mkdir -p "$(dirname "$target")"
+    [[ -f "$target" ]] && backup_file "$target"
+    tmp="$(mktemp "$(dirname "$target")/.init-vps.XXXXXX")"
+    printf '%s\n' "$content" > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$target"
+    return 0
+}
+
+crowdsec_install_packages() {
+    local repo_base="https://packagecloud.io/crowdsec/crowdsec/ubuntu" codename
+    codename="$( . /etc/os-release; echo "${VERSION_CODENAME:-}" )"
+    if [[ -z "$codename" ]] || ! curl -fsSL "${repo_base}/dists/${codename}/Release" >/dev/null 2>&1; then
+        log_warn "Dépôt CrowdSec indisponible pour « ${codename:-inconnu} », repli sur « noble »."
+        codename="noble"
+    fi
+    install -d -m 0755 /etc/apt/keyrings
+    # Clé en ASCII (.asc), comme pour Docker : apt la lit telle quelle, pas besoin de gpg.
+    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey -o /etc/apt/keyrings/crowdsec.asc \
+        || { log_warn "Clé du dépôt CrowdSec introuvable."; return 1; }
+    echo "deb [signed-by=/etc/apt/keyrings/crowdsec.asc] ${repo_base}/ ${codename} main" > /etc/apt/sources.list.d/crowdsec.list
+    apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ipset crowdsec >/dev/null 2>&1 \
+        || { log_warn "Installation du paquet crowdsec en échec (dépôt ${codename})."; return 1; }
+    log_ok "CrowdSec installé (dépôt ${codename})."
+}
+
+step_crowdsec() {
+    log_step "CrowdSec (détection et blocage des attaques web)"
+    if [[ "$CROWDSEC_ENABLED" != "1" ]]; then
+        log_info "CrowdSec non activé (pour l'activer : CROWDSEC_ENABLED=\"1\" dans ${STATE_FILE}, puis --update)."
+        return
+    fi
+
+    if ! command -v cscli &>/dev/null; then
+        crowdsec_install_packages || { log_warn "CrowdSec non installé : le reste du script continue."; return; }
+    fi
+
+    # Configuration du bouncer AVANT son installation : son paquet le démarre
+    # aussitôt, et en mode iptables (défaut) il poserait sa propre chaîne.
+    local ipset_bin changed=0
+    ipset_bin="$(command -v ipset || echo /usr/sbin/ipset)"
+    crowdsec_write_if_changed "$CROWDSEC_BOUNCER_LOCAL" "# Généré par init-vps.sh — surcharge de crowdsec-firewall-bouncer.yaml.
+# Mode ipset : le bouncer remplit les ensembles, apply.sh (DOCKER-USER) les branche.
+mode: ipset
+blacklists_ipv4: crowdsec-blacklists
+blacklists_ipv6: crowdsec6-blacklists
+disable_ipv6: false" && changed=1
+    crowdsec_write_if_changed "$CROWDSEC_BOUNCER_DROPIN" "# Généré par init-vps.sh. Ensembles créés AVANT le bouncer (mode ipset : il ne
+# les crée pas). Mêmes paramètres que dans apply.sh — un -exist sur des
+# paramètres différents échoue.
+[Service]
+ExecStartPre=-${ipset_bin} create crowdsec-blacklists hash:net family inet timeout 0 maxelem 262144 -exist
+ExecStartPre=-${ipset_bin} create crowdsec6-blacklists hash:net family inet6 timeout 0 maxelem 262144 -exist" && changed=1
+    systemctl daemon-reload
+
+    if ! dpkg -s crowdsec-firewall-bouncer-iptables &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec-firewall-bouncer-iptables >/dev/null 2>&1 \
+            || { log_warn "Installation du bouncer pare-feu en échec : rien ne sera bloqué."; return; }
+        changed=1
+    fi
+
+    # Logs des conteneurs nginx (nommés <projet>-nginx-<n> par Compose).
+    # La source docker ne lit que les lignes postérieures à son démarrage.
+    crowdsec_write_if_changed "$CROWDSEC_ACQUIS" "# Généré par init-vps.sh — logs des conteneurs nginx (template WordPress).
+source: docker
+container_name_regexp:
+  - \"-nginx-[0-9]+\$\"
+labels:
+  type: nginx" && changed=1
+
+    cscli hub update >/dev/null 2>&1 || log_warn "cscli hub update en échec (réseau ?)."
+    cscli collections install "${CROWDSEC_COLLECTIONS[@]}" >/dev/null 2>&1 \
+        || log_warn "Installation des collections CrowdSec en échec : ${CROWDSEC_COLLECTIONS[*]}"
+
+    # Liste blanche : réseaux privés, IP du serveur, manager, accès Dokploy.
+    # Une valeur déjà présente renvoie une erreur : ignorée.
+    cscli allowlists inspect init-vps >/dev/null 2>&1 \
+        || cscli allowlists create init-vps -d "init-vps : réseaux privés, serveur, manager, accès Dokploy" >/dev/null 2>&1 \
+        || log_warn "Création de l'allowlist CrowdSec « init-vps » en échec : cscli allowlists list"
+    local a
+    for a in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 "$SERVER_IP" "$MANAGER_IP" "$DOKPLOY_RESTRICT_IP"; do
+        [[ "$a" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || continue
+        cscli allowlists add init-vps "$a" >/dev/null 2>&1 || true
+    done
+
+    # Le mode n'est écrit qu'une fois : un `enforce` choisi ensuite survit aux --update.
+    if [[ ! -f "$CROWDSEC_MODE_FILE" ]]; then
+        mkdir -p "$DOCKER_USER_DIR"
+        echo "simulation" > "$CROWDSEC_MODE_FILE"
+        chmod 644 "$CROWDSEC_MODE_FILE"
+        changed=1
+    fi
+
+    systemctl enable --now crowdsec >/dev/null 2>&1 || true
+    systemctl enable crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    if [[ "$changed" -eq 1 ]]; then
+        systemctl reload-or-restart crowdsec || log_warn "Rechargement de CrowdSec en échec : systemctl status crowdsec"
+        systemctl restart crowdsec-firewall-bouncer || log_warn "Démarrage du bouncer en échec : systemctl status crowdsec-firewall-bouncer"
+    else
+        systemctl start crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    fi
+
+    # Branche l'ensemble dans DOCKER-USER — seulement si la chaîne porte nos règles.
+    if [[ -x "$DOCKER_USER_APPLY" ]] && grep -q -- '--comment init-vps' <<< "$(docker_user_rules)"; then
+        "$DOCKER_USER_APPLY" || log_warn "Réapplication de DOCKER-USER en échec : vps-helper docker-firewall status"
+    else
+        log_warn "DOCKER-USER sans nos règles : l'ensemble CrowdSec n'est branché nulle part (vps-helper docker-firewall apply)."
+    fi
+
+    log_ok "CrowdSec actif, mode « $(head -n 1 "$CROWDSEC_MODE_FILE") » (changer : vps-helper crowdsec enforce|simulate)."
 }
 
 ###############################################################################
@@ -5140,6 +5426,7 @@ SSH_PORT="${SSH_PORT}"
 NOTIFY_ENABLED="${NOTIFY_ENABLED}"
 AUTO_REBOOT="${AUTO_REBOOT}"
 AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME}"
+CROWDSEC_ENABLED="${CROWDSEC_ENABLED}"
 LAST_RUN="$(date -Iseconds)"
 EOF
     chmod 600 "$STATE_FILE"
@@ -5441,6 +5728,9 @@ ask_new_options() {
     if ! state_has AUTO_REBOOT; then
         collect_auto_reboot
     fi
+    if ! state_has CROWDSEC_ENABLED; then
+        collect_crowdsec
+    fi
     # Remote provisionné avant l'issue #1 : aucune clé du manager n'est posée.
     # Une réponse vide est persistée (MANAGER_IP="") et n'est plus reposée —
     # `vps-helper manager` reste le moyen de le faire plus tard.
@@ -5519,6 +5809,7 @@ main() {
         fi
         collect_notify
         collect_auto_reboot
+        collect_crowdsec
         show_recap
 
         confirm "Lancer l'initialisation avec ces paramètres ?" "o" \
@@ -5567,6 +5858,9 @@ main() {
         step_remote_swarm
         step_dokploy_remote
     fi
+    # Après Docker (CrowdSec lit les logs des conteneurs) et après
+    # step_docker_user_firewall (apply.sh pose la règle de son ipset).
+    step_crowdsec
     step_notify
     step_save_state
     step_auto_reboot

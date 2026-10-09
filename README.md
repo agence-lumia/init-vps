@@ -113,7 +113,7 @@ le mode mise à jour ; le drapeau ne fait que répondre « oui » d'avance.
 | 6   | UFW (pare-feu, dont UDP/443 pour HTTP/3)            | 17  | Audit des ports publiés (lecture seule)           |
 | 7   | Durcissement SSH — phase 2 (verrouillage)           | 18  | Installation de Dokploy                           |
 | 8   | Verrouillage du compte root                         | 19  | Optimisation Traefik (HTTP/3 + compression)       |
-| 9   | unattended-upgrades (MAJ sécurité auto)             | 20  | Notifications webhook (optionnel)                 |
+| 9   | unattended-upgrades (MAJ sécurité auto)             | 20  | CrowdSec (attaques web, démarre en simulation) puis notifications webhook (optionnel) |
 | 10  | Durcissement sysctl (réseau + mémoire + perfs), **vérifié au runtime** | 21  | Sauvegarde de la configuration (mode `--update`)  |
 |     |                                                     | 22  | Redémarrage automatique nocturne si requis (optionnel) |
 
@@ -185,6 +185,7 @@ Commande d'administration installée sur le serveur lors de l'initialisation.
 | `vps-helper status`            | État du serveur (identique au message de connexion SSH)       |
 | `vps-helper whitelist <IP>`    | Ajouter une IP de confiance (jamais bannie par fail2ban)      |
 | `vps-helper unban <IP>`        | Débannir une IP bannie par fail2ban                           |
+| `vps-helper crowdsec [action]` | CrowdSec : `status`, `enforce` / `simulate`, `allow <IP>`, `unban <IP>` |
 | `vps-helper close-dokploy`     | Fermer l'accès direct au port 3000 (Dokploy)                  |
 | `vps-helper manager [--ip IP] [--key "clé"]` | Remote : donner accès au manager Dokploy, ou en changer (sans argument : état) |
 | `vps-helper ssh-keys <list\|add\|remove> [user]` | Gérer les clés SSH d'un utilisateur (défaut : compte admin) |

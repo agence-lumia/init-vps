@@ -356,6 +356,48 @@ Dokploy publié un jour en mode ingress, dont le conteneur ne joindrait plus ses
 ⚠️ Un test SSH en rafale vers le manager depuis un remote échoue à la 6ᵉ connexion en
 30 s : c'est la règle `limit` d'UFW, pas un problème réseau (vu pendant le diagnostic).
 
+### CrowdSec (étape 19b) — attaques web, branché sur DOCKER-USER
+
+**fail2ban ne protège pas les sites** : il bannit dans `INPUT`, or le trafic web passe par
+Docker (`FORWARD`, `DOCKER-USER`), exactement comme pour UFW. CrowdSec lit les logs des
+conteneurs nginx du template WordPress et remplit un ipset ; `apply.sh` le branche **en tête**
+de DOCKER-USER (avant ESTABLISHED : un ban coupe aussi les connexions en cours).
+
+Mesuré le 09/10/2026 avant de l'ajouter : 17 839 sondes de remontée de dossiers sur un seul
+site, des scanners hébergés (TC DATACENTER, TECHOFF SRV) qui tournent sur tous les sites.
+
+- **Option, oui par défaut** (`collect_crowdsec`, `CROWDSEC_ENABLED` dans `config.env`, posée
+  par `ask_new_options` aux serveurs existants).
+- **Dépôt packagecloud, repli `noble`** (pas encore de `resolute`, HTTP 404), même schéma
+  qu'`ensure_docker`. Le paquet d'Ubuntu (1.4.6, sans bouncer) est écarté. Installation testée
+  sur un conteneur 26.04 : dépendances OK, seul `systemctl` y manquait.
+- **Bouncer en mode `ipset`** (`crowdsec-firewall-bouncer.yaml.local`) : il ne pose **aucune**
+  règle et ne crée pas l'ensemble (code source v0.0.36 lu) — il vide l'ensemble au démarrage
+  puis ajoute chaque IP avec un timeout. Le drop-in `init-vps.conf` crée donc les deux
+  ensembles en `ExecStartPre`. **Mêmes paramètres dans `apply.sh` et le drop-in**
+  (`hash:net family inet[6] timeout 0 maxelem 262144`) : un `-exist` sur des paramètres
+  différents échoue. Le `.yaml.local` et le drop-in sont écrits **avant** d'installer le
+  paquet du bouncer : son postinst le démarre aussitôt, et en mode iptables (défaut) il
+  poserait sa propre chaîne.
+- **Mode** dans `/usr/local/lib/docker-user/crowdsec`, lu par `apply.sh` : `simulation` = règle
+  **sans cible** (compteur des paquets qui auraient été bloqués), `enforce` = `DROP`. Écrit à
+  `simulation` au premier passage seulement : un `enforce` survit aux `--update`. La
+  simulation de CrowdSec lui-même (`cscli simulation`) n'est pas utilisée : elle ne s'applique
+  pas à la liste communautaire, qui aurait bloqué dès le premier jour.
+- **Source docker**, `container_name_regexp: -nginx-[0-9]+$`, type `nginx`. Par défaut elle ne
+  lit que les lignes **postérieures** à son démarrage (`since` = maintenant, code v1.8.1) :
+  pas de ban sur l'historique. Le parseur nginx lit le format `timed` du template (testé).
+- **Collections** : `nginx`, `base-http-scenarios`, `http-cve`, `wordpress`. Le postinst
+  ajoute de lui-même `linux`/`sshd` : sans effet sur SSH, l'ensemble n'étant branché que dans
+  DOCKER-USER — fail2ban reste en charge de SSH.
+- **Allowlist `init-vps`** : RFC1918, loopback, IP du serveur, `MANAGER_IP`,
+  `DOKPLOY_RESTRICT_IP`. Ajout : `vps-helper crowdsec allow <IP|CIDR>`.
+- **IPv6** : la règle v6 est posée dans le miroir, mais tant que l'IPv6 est désactivé dans
+  Docker, les visiteurs v6 passent par docker-proxy (`INPUT`) et ne sont pas filtrés. Tous les
+  scanners observés étaient en IPv4.
+- `check_crowdsec` : FAIL si activé et non installé, service arrêté, ou ensemble non branché ;
+  INFO en simulation (taille de la liste, paquets qui auraient été bloqués), PASS en enforce.
+
 ### `vps-helper check` — santé des conteneurs
 
 `check_container_health` (section « Santé des conteneurs ») : FAIL pour un conteneur
@@ -680,7 +722,7 @@ autre-clé »
 
 ### Mode mise à jour (`--update` / `/etc/init-vps/config.env`)
 
-`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `DOKPLOY_PORT_CLOSED`, `MANAGER_IP`, `SSH_PORT`, `NOTIFY_ENABLED`, `AUTO_REBOOT`, `AUTO_REBOOT_TIME`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`. **Aucun secret non plus** (URL de webhook : `notify.env`, 600) — ce fichier est `source`-é, toute valeur saisie qui y finit doit passer un validateur au jeu de caractères restreint.
+`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `DOKPLOY_PORT_CLOSED`, `MANAGER_IP`, `SSH_PORT`, `NOTIFY_ENABLED`, `AUTO_REBOOT`, `AUTO_REBOOT_TIME`, `CROWDSEC_ENABLED`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`. **Aucun secret non plus** (URL de webhook : `notify.env`, 600) — ce fichier est `source`-é, toute valeur saisie qui y finit doit passer un validateur au jeu de caractères restreint.
 
 **Nouvelles options et mode mise à jour** : `ask_new_options` pose, et seulement elles, les questions dont la clé est **absente** de `config.env` (`state_has`) — une option apparue après le provisionnement du serveur. Un refus est persisté (`"0"`) et n'est plus jamais reposé. Exception : une option acceptée dont le fichier de secret a disparu est reproposée. Toute future option suit ce schéma : variable vide par défaut, clé dans `step_save_state`, entrée dans `ask_new_options`.
 
