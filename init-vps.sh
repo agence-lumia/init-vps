@@ -2888,10 +2888,19 @@ check_container_memory() {
         return
     fi
     local now full pid started dir max_ev oom_ev limit peak age start_s ratio
-    local steal majf benign swp
-    local -a cheap=()
+    local steal majf benign swp stat_ok span
+    local b_max b_oom b_steal b_majf d_max d_oom d_steal d_majf
+    local -a cheap=() past=()
     local ok_n=0 unlimited_n=0 unreadable_n=0
+    # Les compteurs du cgroup sont cumulés depuis le démarrage du conteneur : relus
+    # tels quels, un épisode unique déclenchait un FAIL chaque matin jusqu'au
+    # redémarrage (vps-client, 11 → 14/10/2026 : `max` figé à 1830/2640/1232 sur
+    # trois wordpress, quatre jours d'alertes pour un lot AVIF d'une heure le 10/10).
+    # On juge donc la hausse depuis le dernier audit quotidien. Seul `--notify`
+    # (le timer) réécrit la référence : un `check` manuel n'ampute pas la fenêtre.
+    local base_file="${IV_LIB}/mem-baseline" base_age=0 new_base="" tmp
     now=$(date +%s)
+    [ -r "$base_file" ] && base_age=$(( now - $(stat -c %Y "$base_file" 2>/dev/null || echo "$now") ))
     while read -r name full pid started; do
         name="${name#/}"
         dir="$(container_cgroup_dir "$full" "$pid")" || { unreadable_n=$((unreadable_n+1)); continue; }
@@ -2902,39 +2911,69 @@ check_container_memory() {
         # Date illisible → âge 0 → « non concluant » : l'erreur penche du côté prudent.
         start_s=$(date -d "$started" +%s 2>/dev/null || echo "$now")
         age=$((now - start_s))
+        max_ev=${max_ev:-0}; oom_ev=${oom_ev:-0}
+        # pgsteal / pgmajfault en correspondance exacte (pas pgsteal_direct, etc.).
+        steal=$(awk '$1 == "pgsteal" {print $2}' "${dir}/memory.stat" 2>/dev/null)
+        majf=$(awk '$1 == "pgmajfault" {print $2}' "${dir}/memory.stat" 2>/dev/null)
+        stat_ok=0
+        [[ "$steal" =~ ^[0-9]+$ ]] && [[ "$majf" =~ ^[0-9]+$ ]] && stat_ok=1
+
+        # Référence du même démarrage seulement : `docker restart` remet les
+        # compteurs à zéro sans changer l'ID, StartedAt les distingue.
+        b_max="" b_oom=0 b_steal=0 b_majf=0
+        read -r b_max b_oom b_steal b_majf < <(awk -v id="$full" -v st="$started" \
+            '$1 == id && $2 == st {print $3, $4, $5, $6}' "$base_file" 2>/dev/null) || true
+        if [ -n "$b_max" ] && [ "$max_ev" -ge "$b_max" ] && [ "$oom_ev" -ge "$b_oom" ]; then
+            d_max=$((max_ev - b_max)); d_oom=$((oom_ev - b_oom))
+            span="depuis le dernier audit (il y a $(human_age "$base_age"))"
+        else
+            # Pas de référence (premier audit, conteneur recréé) : tout le cumul.
+            b_steal=0 b_majf=0
+            d_max=$max_ev; d_oom=$oom_ev
+            span="en $(human_age "$age")"
+        fi
+        d_steal=0 d_majf=0
+        if [ "$stat_ok" -eq 1 ]; then
+            d_steal=$((steal - b_steal)); d_majf=$((majf - b_majf))
+            [ "$d_steal" -lt 0 ] && d_steal=$steal
+            [ "$d_majf" -lt 0 ] && d_majf=$majf
+            new_base+="${full} ${started} ${max_ev} ${oom_ev} ${steal} ${majf}"$'\n'
+        fi
 
         # Un OOM kill est concluant quel que soit l'âge du conteneur.
-        if [ "${oom_ev:-0}" -gt 0 ]; then
-            chk_fail "${name} : ${oom_ev} OOM kill(s) en $(human_age "$age") (limite $(human_bytes "$limit"), atteinte ${max_ev:-0} fois)"
+        if [ "$d_oom" -gt 0 ]; then
+            chk_fail "${name} : ${d_oom} OOM kill(s) ${span} (limite $(human_bytes "$limit"), atteinte ${d_max} fois)"
             fail=$((fail+1))
             continue
         fi
         # Limite atteinte : bénin si le noyau n'a libéré que du cache froid, grave
         # s'il n'y a plus rien à libérer ou si le code est relu depuis le disque.
-        # pgsteal / pgmajfault en correspondance exacte (pas pgsteal_direct, etc.).
         benign=0
-        if [ "${max_ev:-0}" -gt 0 ]; then
-            steal=$(awk '$1 == "pgsteal" {print $2}' "${dir}/memory.stat" 2>/dev/null)
-            majf=$(awk '$1 == "pgmajfault" {print $2}' "${dir}/memory.stat" 2>/dev/null)
-            if ! [[ "$steal" =~ ^[0-9]+$ ]] || ! [[ "$majf" =~ ^[0-9]+$ ]]; then
-                chk_fail "${name} : limite atteinte ${max_ev} fois en $(human_age "$age"), efficacité du reclaim illisible — limite $(human_bytes "$limit")"
+        if [ "$d_max" -gt 0 ]; then
+            if [ "$stat_ok" -eq 0 ]; then
+                chk_fail "${name} : limite atteinte ${d_max} fois ${span}, efficacité du reclaim illisible — limite $(human_bytes "$limit")"
                 fail=$((fail+1))
                 continue
             fi
-            if [ "$steal" -lt $((max_ev * MEM_RECLAIM_MIN_PAGES)) ]; then
-                chk_fail "${name} : limite atteinte ${max_ev} fois sans mémoire récupérable ($((steal / max_ev)) pages libérées par dépassement) en $(human_age "$age") — limite $(human_bytes "$limit"), risque d'OOM"
+            if [ "$d_steal" -lt $((d_max * MEM_RECLAIM_MIN_PAGES)) ]; then
+                chk_fail "${name} : limite atteinte ${d_max} fois sans mémoire récupérable ($((d_steal / d_max)) pages libérées par dépassement) ${span} — limite $(human_bytes "$limit"), risque d'OOM"
                 fail=$((fail+1))
                 continue
             fi
-            if [ "$majf" -gt "$MEM_MAJFAULT_FLOOR" ] && [ $((majf * 10)) -gt "$max_ev" ]; then
+            if [ "$d_majf" -gt "$MEM_MAJFAULT_FLOOR" ] && [ $((d_majf * 10)) -gt "$d_max" ]; then
                 # pgmajfault compte aussi les retours depuis le swap : Docker accorde
                 # par défaut autant de swap que la limite mémoire (memory.swap.max).
                 swp=$(cat "${dir}/memory.swap.current" 2>/dev/null || echo 0)
-                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} défauts de page majeurs (code relu ou swap) en $(human_age "$age") — limite $(human_bytes "$limit"), swap $(human_bytes "${swp:-0}")"
+                chk_fail "${name} : thrashing — limite atteinte ${d_max} fois, ${d_majf} défauts de page majeurs (code relu ou swap) ${span} — limite $(human_bytes "$limit"), swap $(human_bytes "${swp:-0}")"
                 fail=$((fail+1))
                 continue
             fi
-            cheap+=("${name} (${max_ev} dépassements, $((steal / max_ev)) pages de cache libérées chacun)")
+            cheap+=("${name} (${d_max} dépassements ${span}, $((d_steal / d_max)) pages de cache libérées chacun)")
+            benign=1
+        elif [ "$max_ev" -gt 0 ] || [ "$oom_ev" -gt 0 ]; then
+            # Épisode antérieur à la référence, rien depuis : historique. memory.peak
+            # date du même épisode, l'alerte précoce n'a plus de sens (benign=1).
+            past+=("${name} (limite atteinte ${max_ev} fois, ${oom_ev} OOM kill(s) en $(human_age "$age") ; rien depuis il y a $(human_age "$base_age"))")
             benign=1
         fi
         if [ -z "$limit" ] || [ "$limit" = "max" ]; then
@@ -2959,12 +2998,24 @@ check_container_memory() {
         ok_n=$((ok_n+1))
     done < <(docker inspect --format '{{.Name}} {{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "${ids[@]}" 2>/dev/null)
 
+    # Nouvelle référence, écrite par l'audit quotidien seulement. Réécrite en
+    # entier : les conteneurs disparus en sortent d'eux-mêmes.
+    if [ "${notify:-0}" -eq 1 ] && [ "$EUID" -eq 0 ] && mkdir -p "$IV_LIB" 2>/dev/null; then
+        if tmp="$(mktemp "${IV_LIB}/.mem-baseline.XXXXXX" 2>/dev/null)"; then
+            if printf '%s' "$new_base" > "$tmp" && mv -f "$tmp" "$base_file"; then :; else rm -f "$tmp"; fi
+        fi
+    fi
+
     if [ "$ok_n" -gt 0 ]; then
         chk_pass "${ok_n} conteneur(s) limité(s) sans throttling ni OOM depuis au moins $(human_age "$MEM_EVENTS_MIN_AGE")"; pass=$((pass+1))
     fi
     if [ "${#cheap[@]}" -gt 0 ]; then
         chk_info "Limite atteinte, cache de pages libéré sans effet sur les process :"
         printf '      %s\n' "${cheap[@]}"
+    fi
+    if [ "${#past[@]}" -gt 0 ]; then
+        chk_info "Épisode(s) passé(s), aucun dépassement depuis le dernier audit :"
+        printf '      %s\n' "${past[@]}"
     fi
     if [ "${#young[@]}" -gt 0 ]; then
         chk_info "Non concluant pour ${#young[@]} conteneur(s) récent(s) — compteurs remis à zéro à chaque recréation :"

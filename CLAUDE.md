@@ -251,6 +251,26 @@ Un compteur non nul est concluant quel que soit l'âge ; un `max 0` sur un
 conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
 « non concluant », **jamais PASS**. Un faux négatif ici est pire que pas de check.
 
+**Les verdicts portent sur la hausse depuis le dernier audit quotidien**, pas sur le
+cumul. Les compteurs sont cumulés depuis le démarrage : relus tels quels, un épisode
+unique donnait un FAIL chaque matin jusqu'au redémarrage du conteneur. Cas vécu sur
+vps-client, du 11 au 14/10/2026 : trois `wordpress` en « thrashing » quatre jours de
+suite, `max` figé à 1830 / 2640 / 1232, pour un lot de conversion AVIF d'une heure le
+10/10 à 22h (`oom_kill 0`, ~107 pages libérées par dépassement, swap jamais relu).
+
+- Référence : `/var/lib/init-vps/mem-baseline`, une ligne par conteneur
+  (`ID StartedAt max oom_kill pgsteal pgmajfault`). **Seul `check --notify`** (le
+  timer) la réécrit : un `check` manuel compare sans amputer la fenêtre du lendemain.
+- Correspondance sur l'ID **et** `StartedAt` : `docker restart` remet les compteurs à
+  zéro sans changer l'ID.
+- Sans référence (premier audit, conteneur recréé) : le cumul, comme avant.
+- Cumul non nul mais rien depuis la référence → INFO « épisode passé », et pas
+  d'alerte précoce sur `memory.peak` (il date du même épisode).
+- Les seuils (`MEM_RECLAIM_MIN_PAGES`, `MEM_MAJFAULT_FLOOR`) s'appliquent aux
+  deltas. Le plancher de 1000 a été mesuré sur 3 jours de cumul : il est plus large
+  encore sur 24 h.
+- Le journal noyau (OOM kills depuis le boot) n'est **pas** concerné et reste en cumul.
+
 **`max > 0` ne suffit pas.** Le critère est l'**efficacité du reclaim**, lue dans
 `memory.stat` : `pgsteal ÷ max`, soit les pages réellement libérées par dépassement
 (`MEM_RECLAIM_MIN_PAGES=16`).
