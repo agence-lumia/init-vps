@@ -1925,6 +1925,8 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper logs <conteneur>${C_RESET}    Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter)
   ${C_CYAN}vps-helper update${C_RESET}              Mettre à jour le système (sécurité incluse)
   ${C_CYAN}vps-helper check${C_RESET}               Vérifier l'état du durcissement (lecture seule)
+  ${C_CYAN}vps-helper check --reset-memory${C_RESET}
+                                 Acquitter les dépassements mémoire passés (repart de maintenant)
   ${C_CYAN}vps-helper traefik-tuning${C_RESET}      Activer HTTP/3 + compression Traefik (idempotent)
   ${C_CYAN}vps-helper docker-firewall <action>${C_RESET}
                                  Filtrage des ports publiés par Docker (DOCKER-USER)
@@ -3000,9 +3002,16 @@ check_container_memory() {
 
     # Nouvelle référence, écrite par l'audit quotidien seulement. Réécrite en
     # entier : les conteneurs disparus en sortent d'eux-mêmes.
-    if [ "${notify:-0}" -eq 1 ] && [ "$EUID" -eq 0 ] && mkdir -p "$IV_LIB" 2>/dev/null; then
+    # `check --reset-memory` passe par ici aussi (mem_rebase=1).
+    MEM_BASE_SAVED=0
+    if { [ "${notify:-0}" -eq 1 ] || [ "${mem_rebase:-0}" -eq 1 ]; } \
+            && [ "$EUID" -eq 0 ] && mkdir -p "$IV_LIB" 2>/dev/null; then
         if tmp="$(mktemp "${IV_LIB}/.mem-baseline.XXXXXX" 2>/dev/null)"; then
-            if printf '%s' "$new_base" > "$tmp" && mv -f "$tmp" "$base_file"; then :; else rm -f "$tmp"; fi
+            if printf '%s' "$new_base" > "$tmp" && mv -f "$tmp" "$base_file"; then
+                MEM_BASE_SAVED=$(grep -c . <<< "$new_base")
+            else
+                rm -f "$tmp"
+            fi
         fi
     fi
 
@@ -4065,8 +4074,22 @@ check_dokploy_remote() {
 }
 
 cmd_check() {
-    local pass=0 fail=0 notify=0
+    local pass=0 fail=0 notify=0 mem_rebase=0
     [ "${1:-}" = "--notify" ] && notify=1
+
+    # Acquitter un épisode mémoire déjà diagnostiqué : les compteurs actuels
+    # deviennent la référence, sans attendre l'audit du lendemain. Seul effet :
+    # réécrire mem-baseline. Les verdicts calculés au passage sont jetés.
+    if [ "${1:-}" = "--reset-memory" ]; then
+        mem_rebase=1
+        check_container_memory >/dev/null
+        if [ "${MEM_BASE_SAVED:-0}" -gt 0 ]; then
+            echo "Référence mémoire réinitialisée (${MEM_BASE_SAVED} conteneur(s)) : le prochain audit ne jugera que ce qui arrive à partir de maintenant."
+            return 0
+        fi
+        echo "Référence mémoire non écrite (cgroup v1, Docker absent ou aucun conteneur lisible)." >&2
+        return 1
+    fi
 
     printf '\n%b\n' "${C_BOLD}Audit du durcissement du serveur${C_RESET}"
 

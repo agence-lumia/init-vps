@@ -264,6 +264,10 @@ suite, `max` figé à 1830 / 2640 / 1232, pour un lot de conversion AVIF d'une h
 - Correspondance sur l'ID **et** `StartedAt` : `docker restart` remet les compteurs à
   zéro sans changer l'ID.
 - Sans référence (premier audit, conteneur recréé) : le cumul, comme avant.
+- **`vps-helper check --reset-memory`** écrit la référence tout de suite, sans rien
+  auditer d'autre : pour acquitter un épisode déjà diagnostiqué (ou le premier audit
+  après la mise à jour) sans attendre le lendemain. Sort en `1` si rien n'a pu être
+  écrit (cgroup v1, Docker absent).
 - Cumul non nul mais rien depuis la référence → INFO « épisode passé », et pas
   d'alerte précoce sur `memory.peak` (il date du même épisode).
 - Les seuils (`MEM_RECLAIM_MIN_PAGES`, `MEM_MAJFAULT_FLOOR`) s'appliquent aux
