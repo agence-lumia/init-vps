@@ -416,9 +416,11 @@ site, des scanners hébergés (TC DATACENTER, TECHOFF SRV) qui tournent sur tous
   DOCKER-USER — fail2ban reste en charge de SSH.
 - **Allowlist `init-vps`** : RFC1918, loopback, IP du serveur, `MANAGER_IP`,
   `DOKPLOY_RESTRICT_IP`, et `CROWDSEC_ALLOW_EXTRA` : la plage sortante d'Anthropic
-  (`160.79.104.0/21`, claude.ai et ses outils), parce qu'on consulte souvent les sites via
+  (`160.79.104.0/21` ; documentée pour les connecteurs MCP et la recherche/lecture web de
+  l'API, claude.ai très probablement aussi), parce qu'on consulte souvent les sites via
   Claude. Claude Code en local sort par l'IP du poste : celle-ci s'ajoute à la main.
-  Ajout : `vps-helper crowdsec allow <IP|CIDR>`. Un `--update` ajoute les valeurs
+  Ajout : `vps-helper crowdsec allow <IP|CIDR>` (lève aussi les bans en cours, `--range`
+  pour un CIDR). Un `--update` ajoute les valeurs
   manquantes, il n'en retire aucune.
 - **IPv6** : la règle v6 est posée dans le miroir, mais tant que l'IPv6 est désactivé dans
   Docker, les visiteurs v6 passent par docker-proxy (`INPUT`) et ne sont pas filtrés. Tous les

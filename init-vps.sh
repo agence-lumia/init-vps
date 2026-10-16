@@ -2206,7 +2206,11 @@ cmd_crowdsec() {
             [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
                 || { err "Usage : vps-helper crowdsec allow <IP|CIDR> (IPv4)"; exit 1; }
             cscli allowlists add init-vps "$target" >/dev/null 2>&1 || true
-            cscli decisions delete --ip "${target%/*}" >/dev/null 2>&1 || true
+            if [[ "$target" == */* ]]; then
+                cscli decisions delete --range "$target" >/dev/null 2>&1 || true
+            else
+                cscli decisions delete --ip "$target" >/dev/null 2>&1 || true
+            fi
             ok "${target} ajoutée à la liste blanche CrowdSec (jamais bannie), ban éventuel levé."
             ;;
         unban)
@@ -4978,9 +4982,9 @@ CROWDSEC_BOUNCER_LOCAL=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.loc
 CROWDSEC_BOUNCER_DROPIN=/etc/systemd/system/crowdsec-firewall-bouncer.service.d/init-vps.conf
 CROWDSEC_ACQUIS=/etc/crowdsec/acquis.d/init-vps-nginx.yaml
 CROWDSEC_COLLECTIONS=(crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve crowdsecurity/wordpress)
-# Requêtes sortantes d'Anthropic (claude.ai : lecture de pages, connecteurs MCP, outils
-# de l'API) : on consulte souvent les sites via Claude, une rafale de lectures ne doit pas
-# bannir. Plage publiée sur platform.claude.com/docs/en/api/ip-addresses.
+# Requêtes sortantes d'Anthropic (documentées : connecteurs MCP, recherche et lecture web
+# de l'API ; claude.ai très probablement aussi) : on consulte souvent les sites via Claude,
+# une rafale de lectures ne doit pas bannir. Plage : platform.claude.com/docs/en/api/ip-addresses.
 CROWDSEC_ALLOW_EXTRA=(160.79.104.0/21)
 
 # Écrit $2 dans $1 seulement si le contenu change (temporaire + mv). Code 0 =
