@@ -2206,7 +2206,11 @@ cmd_crowdsec() {
             [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
                 || { err "Usage : vps-helper crowdsec allow <IP|CIDR> (IPv4)"; exit 1; }
             cscli allowlists add init-vps "$target" >/dev/null 2>&1 || true
-            cscli decisions delete --ip "${target%/*}" >/dev/null 2>&1 || true
+            if [[ "$target" == */* ]]; then
+                cscli decisions delete --range "$target" >/dev/null 2>&1 || true
+            else
+                cscli decisions delete --ip "$target" >/dev/null 2>&1 || true
+            fi
             ok "${target} ajoutée à la liste blanche CrowdSec (jamais bannie), ban éventuel levé."
             ;;
         unban)
@@ -4978,6 +4982,10 @@ CROWDSEC_BOUNCER_LOCAL=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.loc
 CROWDSEC_BOUNCER_DROPIN=/etc/systemd/system/crowdsec-firewall-bouncer.service.d/init-vps.conf
 CROWDSEC_ACQUIS=/etc/crowdsec/acquis.d/init-vps-nginx.yaml
 CROWDSEC_COLLECTIONS=(crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve crowdsecurity/wordpress)
+# Requêtes sortantes d'Anthropic (documentées : connecteurs MCP, recherche et lecture web
+# de l'API ; claude.ai très probablement aussi) : on consulte souvent les sites via Claude,
+# une rafale de lectures ne doit pas bannir. Plage : platform.claude.com/docs/en/api/ip-addresses.
+CROWDSEC_ALLOW_EXTRA=(160.79.104.0/21)
 
 # Écrit $2 dans $1 seulement si le contenu change (temporaire + mv). Code 0 =
 # fichier modifié.
@@ -5059,13 +5067,14 @@ labels:
     cscli collections install "${CROWDSEC_COLLECTIONS[@]}" >/dev/null 2>&1 \
         || log_warn "Installation des collections CrowdSec en échec : ${CROWDSEC_COLLECTIONS[*]}"
 
-    # Liste blanche : réseaux privés, IP du serveur, manager, accès Dokploy.
+    # Liste blanche : réseaux privés, Anthropic, IP du serveur, manager, accès Dokploy.
     # Une valeur déjà présente renvoie une erreur : ignorée.
     cscli allowlists inspect init-vps >/dev/null 2>&1 \
-        || cscli allowlists create init-vps -d "init-vps : réseaux privés, serveur, manager, accès Dokploy" >/dev/null 2>&1 \
+        || cscli allowlists create init-vps -d "init-vps : réseaux privés, Anthropic, serveur, manager, accès Dokploy" >/dev/null 2>&1 \
         || log_warn "Création de l'allowlist CrowdSec « init-vps » en échec : cscli allowlists list"
     local a
-    for a in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 "$SERVER_IP" "$MANAGER_IP" "$DOKPLOY_RESTRICT_IP"; do
+    for a in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 "${CROWDSEC_ALLOW_EXTRA[@]}" \
+             "$SERVER_IP" "$MANAGER_IP" "$DOKPLOY_RESTRICT_IP"; do
         [[ "$a" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || continue
         cscli allowlists add init-vps "$a" >/dev/null 2>&1 || true
     done
