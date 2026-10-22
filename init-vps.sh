@@ -2485,7 +2485,6 @@ http:
           - zstd
           - br
           - gzip
-        defaultEncoding: br
         minResponseBodyBytes: 1024
         excludedContentTypes:
           - text/event-stream
@@ -2530,6 +2529,22 @@ FRAGEOF
         ok "Flux SSE (text/event-stream) exclus de la compression."
     else
         info "Flux SSE déjà exclus de la compression."
+    fi
+
+    # --- 1c. Pas d'encodage par défaut ---
+    # defaultEncoding s'applique aux requêtes SANS Accept-Encoding : Traefik leur
+    # renvoyait du Brotli qu'elles n'avaient pas demandé. Les navigateurs envoient
+    # toujours l'en-tête (aucun effet sur eux) ; les clients d'API, eux, recevaient
+    # un corps illisible. Mesuré sur vps-client : la connexion Brevo ↔ WooCommerce
+    # échouait alors que le test de connexion répondait 200.
+    # Middleware posé par une version antérieure : on retire la clé.
+    if [[ "$(yq '.http.middlewares.compression.compress | has("defaultEncoding")' "$mconf")" == "true" ]]; then
+        [[ -f "${mconf}.bak-${stamp}" ]] || cp -a "$mconf" "${mconf}.bak-${stamp}"
+        yq -i 'del(.http.middlewares.compression.compress.defaultEncoding)' "$mconf"
+        changed=1
+        ok "Encodage par défaut retiré (réponses non compressées sans Accept-Encoding)."
+    else
+        info "Aucun encodage par défaut imposé."
     fi
 
     # Sauvegarde de traefik.yml avant toute modification (une seule fois),
@@ -4264,6 +4279,11 @@ cmd_check() {
             chk_pass "Flux SSE (text/event-stream) exclus de la compression"; pass=$((pass+1))
         else
             chk_fail "Flux SSE compressés : MCP/streaming bloqués (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
+        fi
+        if [[ "$(yq '.http.middlewares.compression.compress | has("defaultEncoding")' "$mconf" 2>/dev/null)" == "true" ]]; then
+            chk_fail "Compression imposée sans Accept-Encoding : clients d'API cassés (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
+        elif [[ "$(yq '.http.middlewares.compression // "null"' "$mconf" 2>/dev/null)" != "null" ]]; then
+            chk_pass "Pas de compression sans Accept-Encoding"; pass=$((pass+1))
         fi
     fi
 
