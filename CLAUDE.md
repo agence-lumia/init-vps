@@ -61,6 +61,11 @@ Points clés :
   dont le middleware existe déjà reçoit l'exclusion en tête de liste (étape 1b, idempotente) ;
   une liste blanche `includedContentTypes` n'est pas touchée (les deux options s'excluent).
   `check` : FAIL si absente.
+- **Jamais de `defaultEncoding`** : il s'applique aux requêtes sans `Accept-Encoding`, à qui
+  Traefik renvoyait du Brotli non demandé. Les navigateurs ne sont pas concernés (ils envoient
+  toujours l'en-tête), mais les clients d'API recevaient un corps illisible. Constaté sur la
+  connexion Brevo ↔ WooCommerce (test 200 côté site, échec côté Brevo). L'étape 1c retire la
+  clé d'un middleware existant ; `check` : FAIL si présente.
 - HTTP/3 = QUIC sur **UDP/443** : `step_ufw_base` ouvre `443/udp`, et `cmd_traefik_tuning` le garantit aussi (cas d'un serveur provisionné avant l'ajout de cette règle).
 - Le patch utilise `yq` (mikefarah, téléchargé si absent) et un merge profond (`eval-all ... ireduce`) pour **préserver** les middlewares gérés par Dokploy (`redirect-to-https`, `addprefix-*`, etc.). Jamais de réécriture destructive.
 
